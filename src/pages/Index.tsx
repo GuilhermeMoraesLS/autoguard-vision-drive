@@ -1,11 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useAuth } from "@/contexts/AuthContext";
 import { CameraCapture } from "@/components/CameraCapture";
 import { DriverStatus } from "@/components/DriverStatus";
 import { AccessHistory, AccessRecord } from "@/components/AccessHistory";
-import { Shield } from "lucide-react";
+import { Shield, ArrowLeft, LogOut } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
 const Index = () => {
+  const { user, signOut } = useAuth();
+  const navigate = useNavigate();
   const [isVerifying, setIsVerifying] = useState(false);
   const [currentDriver, setCurrentDriver] = useState<{
     authorized: boolean | null;
@@ -17,6 +22,12 @@ const Index = () => {
     timestamp: "--",
   });
   const [accessHistory, setAccessHistory] = useState<AccessRecord[]>([]);
+
+  useEffect(() => {
+    if (!user) {
+      navigate("/auth");
+    }
+  }, [user, navigate]);
 
   const handleCapture = async (imageData: string) => {
     setIsVerifying(true);
@@ -68,18 +79,40 @@ const Index = () => {
     }
   };
 
+  if (!user) return null;
+
   return (
     <div className="min-h-screen bg-gradient-dark">
       {/* Header */}
       <header className="border-b border-border bg-card/50 backdrop-blur-sm">
         <div className="container mx-auto px-4 py-4">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 rounded-lg bg-gradient-primary flex items-center justify-center shadow-glow-primary">
-              <Shield className="w-7 h-7 text-primary-foreground" />
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-lg bg-gradient-primary flex items-center justify-center shadow-glow-primary">
+                <Shield className="w-7 h-7 text-primary-foreground" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold text-foreground">AutoGuard Vision Web</h1>
+                <p className="text-sm text-muted-foreground">Verificação de Motorista</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-2xl font-bold text-foreground">AutoGuard Vision Web</h1>
-              <p className="text-sm text-muted-foreground">Sistema de Reconhecimento Facial</p>
+            <div className="flex gap-2">
+              <Button
+                onClick={() => navigate("/")}
+                variant="secondary"
+                size="sm"
+              >
+                <ArrowLeft className="w-4 h-4 mr-2" />
+                Voltar
+              </Button>
+              <Button
+                onClick={signOut}
+                variant="secondary"
+                size="sm"
+              >
+                <LogOut className="w-4 h-4 mr-2" />
+                Sair
+              </Button>
             </div>
           </div>
         </div>

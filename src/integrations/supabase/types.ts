@@ -14,7 +14,97 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      authorized_drivers: {
+        Row: {
+          car_id: string
+          created_at: string
+          face_encoding: string | null
+          id: string
+          name: string
+          photo_url: string
+        }
+        Insert: {
+          car_id: string
+          created_at?: string
+          face_encoding?: string | null
+          id?: string
+          name: string
+          photo_url: string
+        }
+        Update: {
+          car_id?: string
+          created_at?: string
+          face_encoding?: string | null
+          id?: string
+          name?: string
+          photo_url?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "authorized_drivers_car_id_fkey"
+            columns: ["car_id"]
+            isOneToOne: false
+            referencedRelation: "cars"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      cars: {
+        Row: {
+          brand: string
+          created_at: string
+          id: string
+          model: string
+          plate: string
+          user_id: string
+          year: number | null
+        }
+        Insert: {
+          brand: string
+          created_at?: string
+          id?: string
+          model: string
+          plate: string
+          user_id: string
+          year?: number | null
+        }
+        Update: {
+          brand?: string
+          created_at?: string
+          id?: string
+          model?: string
+          plate?: string
+          user_id?: string
+          year?: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "cars_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "profiles"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      profiles: {
+        Row: {
+          created_at: string
+          full_name: string
+          id: string
+        }
+        Insert: {
+          created_at?: string
+          full_name: string
+          id: string
+        }
+        Update: {
+          created_at?: string
+          full_name?: string
+          id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
