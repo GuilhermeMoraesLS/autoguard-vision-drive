@@ -102,12 +102,21 @@ const Index = () => {
   }, [user, carId, navigate]);
 
   const handleCapture = async (imageData: string) => {
+    console.log("🔄 Iniciando verificação...");
+    console.log("📊 Dados disponíveis:", {
+      carId,
+      authorizedDriversCount: authorizedDrivers.length,
+      backendUrl: import.meta.env.VITE_BACKEND_URL
+    });
+
     if (!carId) {
+      console.error("❌ Erro: carId não informado");
       toast.error("Carro não informado");
       return;
     }
 
     if (!authorizedDrivers.length) {
+      console.error("❌ Erro: Nenhum motorista autorizado");
       toast.error("Nenhum motorista autorizado cadastrado para este veículo");
       return;
     }
@@ -117,8 +126,23 @@ const Index = () => {
     setCurrentDriver({ authorized: null, name: "Verificando...", timestamp: "--" });
 
     try {
-      // --- CHAMADA PARA O BACKEND PYTHON ---
       const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+      console.log("🌐 URL do backend:", backendBaseUrl);
+      
+      const requestData = {
+        image: imageData.substring(0, 50) + "...", // Log apenas início da imagem
+        car_id: carId,
+        authorized_drivers: authorizedDrivers.map((driver) => ({
+          id: driver.id,
+          name: driver.name,
+          photo_url: driver.photo_url,
+        })),
+      };
+      
+      console.log("📤 Enviando dados para o backend:", {
+        ...requestData,
+        image: `[Base64 image - ${imageData.length} chars]`
+      });
 
       const response = await fetch(`${backendBaseUrl}/verify_driver`, {
         method: "POST",
@@ -135,7 +159,13 @@ const Index = () => {
           })),
         }),
       });
-      // --- FIM DA CHAMADA ---
+
+      console.log("📥 Resposta recebida:", {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok,
+        headers: Object.fromEntries(response.headers.entries())
+      });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ error: `Erro na API: ${response.status} ${response.statusText}` }));
@@ -173,7 +203,11 @@ const Index = () => {
         });
       }
     } catch (error) {
-      console.error("Erro na verificação:", error);
+      console.error("❌ Erro na verificação:", error);
+      console.error("📋 Detalhes do erro:", {
+        message: error instanceof Error ? error.message : "Erro desconhecido",
+        stack: error instanceof Error ? error.stack : undefined
+      });
       toast.error(`Erro ao verificar: ${error instanceof Error ? error.message : "Erro desconhecido"}`);
       setCurrentDriver({ authorized: false, name: "Erro na verificação", timestamp: new Date().toLocaleString("pt-BR") });
     } finally {
