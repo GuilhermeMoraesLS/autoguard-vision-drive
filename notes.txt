@@ -1,0 +1,8 @@
+Após mudar o .env:
+
+Reinicie o Vite: npm run dev
+Reinicie o backend (para ler BACKEND_ALLOWED_ORIGINS)
+Resumo do que editar quando o ngrok mudar:
+
+VITE_BACKEND_URL (ngrok do backend)
+Se estiver expondo o frontend pelo ngrok, VITE_ALLOWED_HOST e BACKEND_ALLOWED_ORIGINS com o novo domínio do frontend.

@@ -19,11 +19,18 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
       });
       
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        streamRef.current = stream;
-        setIsStreaming(true);
-      }
+      // Defina o streaming primeiro e guarde o stream
+      streamRef.current = stream;
+      setIsStreaming(true);
+
+      // Vincule o stream ao vídeo após o render
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          // @ts-expect-error - srcObject é suportado em browsers modernos
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+      });
     } catch (error) {
       console.error("Camera access error:", error);
       toast.error("Não foi possível acessar a câmera");
@@ -34,9 +41,28 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
-      setIsStreaming(false);
     }
+    if (videoRef.current) {
+      // @ts-expect-error - srcObject é suportado em browsers modernos
+      videoRef.current.srcObject = null;
+    }
+    setIsStreaming(false);
   };
+
+  // Garante que o vídeo receba o stream quando isStreaming mudar
+  useEffect(() => {
+    if (isStreaming && videoRef.current && streamRef.current) {
+      // @ts-expect-error - srcObject é suportado em browsers modernos
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [isStreaming]);
+
+  useEffect(() => {
+    return () => {
+      stopCamera();
+    };
+  }, []);
 
   const captureImage = () => {
     if (!videoRef.current) return;
@@ -52,12 +78,6 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
     const imageData = canvas.toDataURL("image/jpeg", 0.8);
     onCapture(imageData);
   };
-
-  useEffect(() => {
-    return () => {
-      stopCamera();
-    };
-  }, []);
 
   return (
     <div className="w-full">

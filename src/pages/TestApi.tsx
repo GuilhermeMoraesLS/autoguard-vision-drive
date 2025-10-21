@@ -19,9 +19,9 @@ const TestApi = () => {
 
   const checkApiHealth = async () => {
     setApiStatus({ ...apiStatus, loading: true, error: null });
-    
     try {
-      const response = await fetch('http://localhost:8000/health');
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+      const response = await fetch(`${backendBaseUrl}/health`);
       
       if (response.ok) {
         const data = await response.json();
@@ -50,10 +50,10 @@ const TestApi = () => {
 
   const testRecognition = async () => {
     try {
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
       // Simula uma imagem base64 de teste
       const testImage = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAAAAAAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCdABmX/9k=";
-      
-      const response = await fetch('http://localhost:8000/verify_driver', {
+      const response = await fetch(`${backendBaseUrl}/verify_driver`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

@@ -11,6 +11,7 @@ import NewCar from "./pages/NewCar";
 import CarDetails from "./pages/CarDetails";
 import NewDriver from "./pages/NewDriver";
 import NotFound from "./pages/NotFound";
+import TestApi from "./pages/TestApi";
 
 const queryClient = new QueryClient();
 
@@ -29,6 +30,7 @@ const App = () => (
             <Route path="/cars/:id" element={<CarDetails />} />
             <Route path="/cars/:id/verify" element={<Index />} />
             <Route path="/cars/:id/drivers/new" element={<NewDriver />} />
+            <Route path="/test-api" element={<TestApi />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />
           </Routes>

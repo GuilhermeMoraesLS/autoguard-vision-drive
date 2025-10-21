@@ -114,9 +114,13 @@ const Index = () => {
 
     setIsVerifying(true);
     toast.info("Processando imagem...");
+    setCurrentDriver({ authorized: null, name: "Verificando...", timestamp: "--" });
 
     try {
-      const response = await fetch("http://localhost:8000/verify_driver", {
+      // --- CHAMADA PARA O BACKEND PYTHON ---
+      const backendBaseUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+
+      const response = await fetch(`${backendBaseUrl}/verify_driver`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -131,9 +135,11 @@ const Index = () => {
           })),
         }),
       });
+      // --- FIM DA CHAMADA ---
 
       if (!response.ok) {
-        throw new Error(`Erro na API: ${response.status}`);
+        const errorData = await response.json().catch(() => ({ error: `Erro na API: ${response.status} ${response.statusText}` }));
+        throw new Error(errorData.error || `Erro na API: ${response.status} ${response.statusText}`);
       }
 
       const result = await response.json();
@@ -148,25 +154,28 @@ const Index = () => {
       });
 
       const newRecord: AccessRecord = {
-        id: Date.now().toString(),
+        id: `${Date.now()}-${Math.random()}`,
         driver: recognizedName,
         status: result.authorized ? "authorized" : "unauthorized",
         timestamp,
       };
-      setAccessHistory((prev) => [newRecord, ...prev]);
+      setAccessHistory((prev) => [newRecord, ...prev].slice(0, 10));
 
       if (result.authorized) {
         toast.success(result.message ?? `Motorista autorizado: ${recognizedName}`, {
           description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
+          duration: 5000,
         });
       } else {
         toast.error(result.message ?? "Motorista não reconhecido!", {
           description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
+          duration: 5000,
         });
       }
     } catch (error) {
-      console.error("Verification error:", error);
-      toast.error("Erro ao verificar motorista");
+      console.error("Erro na verificação:", error);
+      toast.error(`Erro ao verificar: ${error instanceof Error ? error.message : "Erro desconhecido"}`);
+      setCurrentDriver({ authorized: false, name: "Erro na verificação", timestamp: new Date().toLocaleString("pt-BR") });
     } finally {
       setIsVerifying(false);
     }
