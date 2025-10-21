@@ -118,9 +118,8 @@ const Dashboard = () => {
               <Card
                 key={car.id}
                 className="p-6 bg-card border-border hover:border-primary transition-colors cursor-pointer"
-                onClick={() => navigate(`/cars/${car.id}`)}
               >
-                <div className="flex items-start gap-4">
+                <div className="flex items-start gap-4" onClick={() => navigate(`/cars/${car.id}`)}>
                   <div className="w-12 h-12 rounded-lg bg-secondary flex items-center justify-center">
                     <CarIcon className="w-6 h-6 text-primary" />
                   </div>
@@ -133,6 +132,27 @@ const Dashboard = () => {
                       <p className="text-xs text-muted-foreground mt-1">{car.year}</p>
                     )}
                   </div>
+                </div>
+                <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                  <Button
+                    className="w-full bg-gradient-primary hover:opacity-90 transition-opacity shadow-glow-primary"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      navigate(`/cars/${car.id}/verify`);
+                    }}
+                  >
+                    Iniciar verificação
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    className="w-full"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      navigate(`/cars/${car.id}`);
+                    }}
+                  >
+                    Detalhes do carro
+                  </Button>
                 </div>
               </Card>
             ))}

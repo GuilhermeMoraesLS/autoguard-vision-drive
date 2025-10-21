@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { CameraCapture } from "@/components/CameraCapture";
 import { DriverStatus } from "@/components/DriverStatus";
@@ -8,9 +9,26 @@ import { Shield, ArrowLeft, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
+interface AuthorizedDriver {
+  id: string;
+  name: string;
+  photo_url: string;
+}
+
+interface Car {
+  id: string;
+  brand: string;
+  model: string;
+  plate: string;
+}
+
 const Index = () => {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const { id: carId } = useParams<{ id: string }>();
+  const [car, setCar] = useState<Car | null>(null);
+  const [authorizedDrivers, setAuthorizedDrivers] = useState<AuthorizedDriver[]>([]);
+  const [isLoadingCar, setIsLoadingCar] = useState(true);
   const [isVerifying, setIsVerifying] = useState(false);
   const [currentDriver, setCurrentDriver] = useState<{
     authorized: boolean | null;
@@ -26,50 +44,125 @@ const Index = () => {
   useEffect(() => {
     if (!user) {
       navigate("/auth");
+      return;
     }
-  }, [user, navigate]);
+    if (!carId) {
+      toast.error("Carro não informado");
+      navigate("/");
+      return;
+    }
+    const fetchData = async () => {
+      try {
+        const { data: carData, error: carError } = await supabase
+          .from("cars")
+          .select("id, brand, model, plate, user_id")
+          .eq("id", carId)
+          .single();
+
+        if (carError || !carData) {
+          toast.error("Carro não encontrado");
+          navigate("/");
+          return;
+        }
+
+        if (carData.user_id !== user.id) {
+          toast.error("Você não tem acesso a este veículo");
+          navigate("/");
+          return;
+        }
+
+        setCar({
+          id: carData.id,
+          brand: carData.brand,
+          model: carData.model,
+          plate: carData.plate,
+        });
+
+        const { data: driversData, error: driversError } = await supabase
+          .from("authorized_drivers")
+          .select("id, name, photo_url")
+          .eq("car_id", carId)
+          .order("created_at", { ascending: false });
+
+        if (driversError) {
+          toast.error("Erro ao carregar motoristas autorizados");
+          setAuthorizedDrivers([]);
+        } else {
+          setAuthorizedDrivers(driversData || []);
+        }
+      } catch {
+        toast.error("Erro ao carregar dados do veículo");
+        navigate("/");
+      } finally {
+        setIsLoadingCar(false);
+      }
+    };
+
+    fetchData();
+  }, [user, carId, navigate]);
 
   const handleCapture = async (imageData: string) => {
+    if (!carId) {
+      toast.error("Carro não informado");
+      return;
+    }
+
+    if (!authorizedDrivers.length) {
+      toast.error("Nenhum motorista autorizado cadastrado para este veículo");
+      return;
+    }
+
     setIsVerifying(true);
     toast.info("Processando imagem...");
 
     try {
-      // TODO: Substituir por chamada real à API Python
-      // const response = await fetch('YOUR_PYTHON_API_URL/verify_driver', {
-      //   method: 'POST',
-      //   headers: { 'Content-Type': 'application/json' },
-      //   body: JSON.stringify({ image: imageData })
-      // });
-      // const result = await response.json();
-
-      // Simulação temporária (REMOVER quando integrar com Python)
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      const mockResult = Math.random() > 0.5 
-        ? { authorized: true, driver: "Guilherme Lopes", timestamp: new Date().toLocaleString("pt-BR") }
-        : { authorized: false, driver: "Desconhecido", timestamp: new Date().toLocaleString("pt-BR") };
-
-      // Atualizar status atual
-      setCurrentDriver({
-        authorized: mockResult.authorized,
-        name: mockResult.driver,
-        timestamp: mockResult.timestamp,
+      const response = await fetch("http://localhost:8000/verify_driver", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          image: imageData,
+          car_id: carId,
+          authorized_drivers: authorizedDrivers.map((driver) => ({
+            id: driver.id,
+            name: driver.name,
+            photo_url: driver.photo_url,
+          })),
+        }),
       });
 
-      // Adicionar ao histórico
+      if (!response.ok) {
+        throw new Error(`Erro na API: ${response.status}`);
+      }
+
+      const result = await response.json();
+
+      const recognizedName = result.driver_name ?? "Desconhecido";
+      const timestamp = new Date().toLocaleString("pt-BR");
+
+      setCurrentDriver({
+        authorized: result.authorized,
+        name: recognizedName,
+        timestamp,
+      });
+
       const newRecord: AccessRecord = {
         id: Date.now().toString(),
-        driver: mockResult.driver,
-        status: mockResult.authorized ? "authorized" : "unauthorized",
-        timestamp: mockResult.timestamp,
+        driver: recognizedName,
+        status: result.authorized ? "authorized" : "unauthorized",
+        timestamp,
       };
-      setAccessHistory(prev => [newRecord, ...prev]);
+      setAccessHistory((prev) => [newRecord, ...prev]);
 
-      // Feedback
-      if (mockResult.authorized) {
-        toast.success(`Motorista autorizado: ${mockResult.driver}`);
+      if (result.authorized) {
+        toast.success(result.message ?? `Motorista autorizado: ${recognizedName}`, {
+          description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
+        });
       } else {
-        toast.error("Motorista não reconhecido!");
+        toast.error(result.message ?? "Motorista não reconhecido!", {
+          description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
+        });
       }
     } catch (error) {
       console.error("Verification error:", error);
@@ -79,7 +172,17 @@ const Index = () => {
     }
   };
 
-  if (!user) return null;
+  if (!user || isLoadingCar) {
+    return (
+      <div className="min-h-screen bg-gradient-dark flex items-center justify-center">
+        <p className="text-muted-foreground">Carregando...</p>
+      </div>
+    );
+  }
+
+  if (!car) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-gradient-dark">
