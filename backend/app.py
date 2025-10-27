@@ -526,3 +526,5 @@ if __name__ == "__main__":
         logging.error(f"❌ Erro no sistema de detecção: {e}")
     
     app.run(debug=True, host="0.0.0.0", port=port)
+
+    #SADAD
