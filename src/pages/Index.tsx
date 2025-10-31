@@ -22,6 +22,27 @@ interface Car {
   plate: string;
 }
 
+// Interface para a nova estrutura de resposta da API
+interface DetectionResult {
+  authorized: boolean;
+  driver_id: string | null;
+  driver_name: string;
+  confidence: number;
+}
+
+interface ApiResponse {
+  status: string;
+  message: string;
+  detections: DetectionResult[];
+  car_id: string;
+  authorized_count: number;
+  unknown_count: number;
+  thresholds: {
+    strict: number;
+    loose: number;
+  };
+}
+
 const Index = () => {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
@@ -34,6 +55,10 @@ const Index = () => {
     authorized: boolean | null;
     name: string;
     timestamp: string;
+    confidence?: number;
+    totalDetections?: number;
+    authorizedCount?: number;
+    unknownCount?: number;
   }>({
     authorized: null,
     name: "Aguardando...",
@@ -42,55 +67,44 @@ const Index = () => {
   const [accessHistory, setAccessHistory] = useState<AccessRecord[]>([]);
 
   useEffect(() => {
-    if (!user) {
-      navigate("/auth");
-      return;
-    }
-    if (!carId) {
-      toast.error("Carro não informado");
-      navigate("/");
-      return;
-    }
-    const fetchData = async () => {
+    const fetchCarAndDrivers = async () => {
+      if (!carId || !user) return;
+
       try {
+        setIsLoadingCar(true);
+
+        // Buscar dados do carro
         const { data: carData, error: carError } = await supabase
           .from("cars")
-          .select("id, brand, model, plate, user_id")
+          .select("*")
           .eq("id", carId)
           .single();
 
-        if (carError || !carData) {
-          toast.error("Carro não encontrado");
-          navigate("/");
-          return;
-        }
+        if (carError) throw carError;
 
-        if (carData.user_id !== user.id) {
-          toast.error("Você não tem acesso a este veículo");
-          navigate("/");
-          return;
-        }
+        setCar(carData);
 
-        setCar({
-          id: carData.id,
-          brand: carData.brand,
-          model: carData.model,
-          plate: carData.plate,
-        });
-
+        // Buscar motoristas autorizados
         const { data: driversData, error: driversError } = await supabase
-          .from("authorized_drivers")
-          .select("id, name, photo_url")
-          .eq("car_id", carId)
-          .order("created_at", { ascending: false });
+          .from("car_drivers")
+          .select(`
+            drivers (
+              id,
+              name,
+              photo_url
+            )
+          `)
+          .eq("car_id", carId);
 
-        if (driversError) {
-          toast.error("Erro ao carregar motoristas autorizados");
-          setAuthorizedDrivers([]);
-        } else {
-          setAuthorizedDrivers(driversData || []);
-        }
-      } catch {
+        if (driversError) throw driversError;
+
+        const drivers = driversData
+          ?.map((item) => item.drivers)
+          .filter(Boolean) as AuthorizedDriver[];
+
+        setAuthorizedDrivers(drivers || []);
+      } catch (error) {
+        console.error("Erro ao buscar dados:", error);
         toast.error("Erro ao carregar dados do veículo");
         navigate("/");
       } finally {
@@ -98,11 +112,12 @@ const Index = () => {
       }
     };
 
-    fetchData();
-  }, [user, carId, navigate]);
+    fetchCarAndDrivers();
+  }, [carId, user, navigate]);
 
   const handleCapture = async (imageData: string) => {
     console.log("🔄 Iniciando verificação...");
+    
     console.log("📊 Dados disponíveis:", {
       carId,
       authorizedDriversCount: authorizedDrivers.length,
@@ -130,18 +145,19 @@ const Index = () => {
       console.log("🌐 URL do backend:", backendBaseUrl);
       
       const requestData = {
-        image: imageData.substring(0, 50) + "...", // Log apenas início da imagem
+        image: imageData,
         car_id: carId,
-        authorized_drivers: authorizedDrivers.map((driver) => ({
+        authorized_drivers: authorizedDrivers.map(driver => ({
           id: driver.id,
           name: driver.name,
-          photo_url: driver.photo_url,
-        })),
+          photo_url: driver.photo_url
+        }))
       };
-      
-      console.log("📤 Enviando dados para o backend:", {
-        ...requestData,
-        image: `[Base64 image - ${imageData.length} chars]`
+
+      console.log("📤 Enviando requisição:", {
+        url: `${backendBaseUrl}/verify_driver`,
+        driversCount: requestData.authorized_drivers.length,
+        carId: requestData.car_id
       });
 
       const response = await fetch(`${backendBaseUrl}/verify_driver`, {
@@ -149,67 +165,120 @@ const Index = () => {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          image: imageData,
-          car_id: carId,
-          authorized_drivers: authorizedDrivers.map((driver) => ({
-            id: driver.id,
-            name: driver.name,
-            photo_url: driver.photo_url,
-          })),
-        }),
+        body: JSON.stringify(requestData),
       });
 
       console.log("📥 Resposta recebida:", {
         status: response.status,
         statusText: response.statusText,
-        ok: response.ok,
-        headers: Object.fromEntries(response.headers.entries())
+        ok: response.ok
       });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: `Erro na API: ${response.status} ${response.statusText}` }));
+        const errorData = await response.json().catch(() => ({ 
+          error: `Erro na API: ${response.status} ${response.statusText}` 
+        }));
         throw new Error(errorData.error || `Erro na API: ${response.status} ${response.statusText}`);
       }
 
-      const result = await response.json();
+      const result: ApiResponse = await response.json();
+      console.log("📊 Resultado completo da API:", result);
 
-      const recognizedName = result.driver_name ?? "Desconhecido";
+      // Processar múltiplas detecções
       const timestamp = new Date().toLocaleString("pt-BR");
+      
+      if (result.detections && result.detections.length > 0) {
+        console.log("✅ Detecções encontradas:", result.detections);
+        
+        // Encontrar a detecção com maior confiança para exibição principal
+        const bestDetection = result.detections.reduce((prev, current) => 
+          current.confidence > prev.confidence ? current : prev
+        );
 
-      setCurrentDriver({
-        authorized: result.authorized,
-        name: recognizedName,
-        timestamp,
-      });
+        // Criar nome descritivo baseado nos resultados
+        let statusName = "";
+        if (result.authorized_count > 0 && result.unknown_count > 0) {
+          statusName = `${result.authorized_count} autorizado(s), ${result.unknown_count} desconhecido(s)`;
+        } else if (result.authorized_count > 0) {
+          if (result.authorized_count === 1) {
+            // Se só há 1 autorizado, mostra o nome específico
+            const authorizedDetection = result.detections.find(d => d.authorized);
+            statusName = authorizedDetection ? authorizedDetection.driver_name : `${result.authorized_count} autorizado`;
+          } else {
+            statusName = `${result.authorized_count} autorizados`;
+          }
+        } else {
+          statusName = `${result.unknown_count} desconhecido(s)`;
+        }
 
-      const newRecord: AccessRecord = {
-        id: `${Date.now()}-${Math.random()}`,
-        driver: recognizedName,
-        status: result.authorized ? "authorized" : "unauthorized",
-        timestamp,
-      };
-      setAccessHistory((prev) => [newRecord, ...prev].slice(0, 10));
-
-      if (result.authorized) {
-        toast.success(result.message ?? `Motorista autorizado: ${recognizedName}`, {
-          description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
-          duration: 5000,
+        // Atualizar status atual
+        setCurrentDriver({
+          authorized: result.authorized_count > 0,
+          name: statusName,
+          timestamp,
+          confidence: bestDetection.confidence,
+          totalDetections: result.detections.length,
+          authorizedCount: result.authorized_count,
+          unknownCount: result.unknown_count
         });
+
+        // Adicionar TODOS os registros ao histórico (um para cada pessoa detectada)
+        const newRecords: AccessRecord[] = result.detections.map((detection, index) => ({
+          id: `${Date.now()}-${index}`,
+          driver: detection.driver_name,
+          status: detection.authorized ? "authorized" : "unauthorized",
+          timestamp,
+          confidence: detection.confidence
+        }));
+
+        // Adicionar no topo do histórico
+        setAccessHistory((prev) => [...newRecords, ...prev].slice(0, 50));
+
+        console.log("📋 Novos registros adicionados ao histórico:", newRecords);
+
+        // Mostrar notificação com resumo
+        if (result.authorized_count > 0) {
+          toast.success(`✅ ${result.authorized_count} motorista(s) autorizado(s) detectado(s)`, {
+            description: `${result.unknown_count > 0 ? `⚠️ ${result.unknown_count} desconhecido(s) também detectado(s) • ` : ''}Confiança máxima: ${bestDetection.confidence.toFixed(1)}%`,
+            duration: 6000,
+          });
+        } else {
+          toast.error(`❌ ${result.unknown_count} pessoa(s) desconhecida(s) detectada(s)!`, {
+            description: `Confiança máxima: ${bestDetection.confidence.toFixed(1)}%`,
+            duration: 6000,
+          });
+        }
       } else {
-        toast.error(result.message ?? "Motorista não reconhecido!", {
-          description: `Confiança: ${result.confidence?.toFixed?.(1) ?? "N/A"}% · Tempo: ${result.processing_time ?? "N/A"}s`,
+        // Nenhuma face detectada
+        console.log("❌ Nenhuma face detectada");
+        setCurrentDriver({
+          authorized: false,
+          name: "Nenhuma face detectada",
+          timestamp,
+          totalDetections: 0,
+          authorizedCount: 0,
+          unknownCount: 0
+        });
+
+        toast.error("❌ Nenhum rosto detectado na imagem", {
+          description: "Certifique-se de que há uma pessoa visível na captura",
           duration: 5000,
         });
       }
+
     } catch (error) {
       console.error("❌ Erro na verificação:", error);
       console.error("📋 Detalhes do erro:", {
         message: error instanceof Error ? error.message : "Erro desconhecido",
         stack: error instanceof Error ? error.stack : undefined
       });
-      toast.error(`Erro ao verificar: ${error instanceof Error ? error.message : "Erro desconhecido"}`);
-      setCurrentDriver({ authorized: false, name: "Erro na verificação", timestamp: new Date().toLocaleString("pt-BR") });
+      
+      toast.error(`❌ Erro ao verificar: ${error instanceof Error ? error.message : "Erro desconhecido"}`);
+      setCurrentDriver({ 
+        authorized: false, 
+        name: "Erro na verificação", 
+        timestamp: new Date().toLocaleString("pt-BR") 
+      });
     } finally {
       setIsVerifying(false);
     }
@@ -239,7 +308,9 @@ const Index = () => {
               </div>
               <div>
                 <h1 className="text-2xl font-bold text-foreground">AutoGuard Vision Web</h1>
-                <p className="text-sm text-muted-foreground">Verificação de Motorista</p>
+                <p className="text-sm text-muted-foreground">
+                  Verificação de Motorista - {car?.brand} {car?.model} ({car?.plate})
+                </p>
               </div>
             </div>
             <div className="flex gap-2">
@@ -272,13 +343,13 @@ const Index = () => {
             <div>
               <h2 className="text-xl font-bold text-foreground mb-2">Captura de Imagem</h2>
               <p className="text-sm text-muted-foreground">
-                Posicione o motorista em frente à câmera e clique em "Verificar Motorista"
+                Posicione o(s) motorista(s) em frente à câmera e clique em "Verificar Motorista"
               </p>
             </div>
             <CameraCapture onCapture={handleCapture} isVerifying={isVerifying} />
           </div>
 
-          {/* Right Column - Status & History */}
+          {/* Right Column - Status & Info */}
           <div className="space-y-6">
             <div>
               <h2 className="text-xl font-bold text-foreground mb-2">Status Atual</h2>
@@ -289,7 +360,39 @@ const Index = () => {
                 authorized={currentDriver.authorized}
                 driverName={currentDriver.name}
                 timestamp={currentDriver.timestamp}
+                confidence={currentDriver.confidence}
+                totalDetections={currentDriver.totalDetections}
+                authorizedCount={currentDriver.authorizedCount}
+                unknownCount={currentDriver.unknownCount}
               />
+            </div>
+
+            {/* Motoristas Autorizados */}
+            <div>
+              <h3 className="text-lg font-semibold text-foreground mb-2">
+                Motoristas Autorizados ({authorizedDrivers.length})
+              </h3>
+              {authorizedDrivers.length > 0 ? (
+                <div className="space-y-2">
+                  {authorizedDrivers.slice(0, 3).map((driver) => (
+                    <div key={driver.id} className="flex items-center gap-2 p-2 bg-secondary/30 rounded-lg">
+                      <img 
+                        src={driver.photo_url} 
+                        alt={driver.name}
+                        className="w-8 h-8 rounded-full object-cover"
+                      />
+                      <span className="text-sm text-foreground">{driver.name}</span>
+                    </div>
+                  ))}
+                  {authorizedDrivers.length > 3 && (
+                    <p className="text-xs text-muted-foreground">
+                      +{authorizedDrivers.length - 3} outros...
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">Nenhum motorista cadastrado</p>
+              )}
             </div>
           </div>
         </div>
@@ -297,26 +400,6 @@ const Index = () => {
         {/* History Table - Full Width */}
         <div className="mt-8">
           <AccessHistory records={accessHistory} />
-        </div>
-
-        {/* Integration Note */}
-        <div className="mt-8 p-6 bg-accent/10 border border-accent/30 rounded-lg">
-          <h3 className="text-lg font-semibold text-foreground mb-2 flex items-center gap-2">
-            <Shield className="w-5 h-5 text-accent" />
-            Integração com Backend Python
-          </h3>
-          <p className="text-sm text-muted-foreground mb-3">
-            Para conectar ao seu backend Python, edite o arquivo <code className="px-2 py-1 bg-secondary rounded text-accent font-mono text-xs">src/pages/Index.tsx</code> na função <code className="px-2 py-1 bg-secondary rounded text-accent font-mono text-xs">handleCapture</code>:
-          </p>
-          <pre className="bg-secondary p-4 rounded-lg text-xs text-foreground overflow-x-auto">
-{`// Substitua o mock pela chamada real:
-const response = await fetch('YOUR_API_URL/verify_driver', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ image: imageData })
-});
-const result = await response.json();`}
-          </pre>
         </div>
       </main>
     </div>

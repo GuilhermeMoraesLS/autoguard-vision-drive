@@ -163,11 +163,11 @@ def get_face_cascade() -> Optional[cv2.CascadeClassifier]:
     global _face_cascade
     if _face_cascade is None:
         try:
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
             _face_cascade = cv2.CascadeClassifier(cascade_path)
             if _face_cascade.empty():
                 raise Exception("Classificador não foi carregado corretamente")
-            logger.info("✅ Classificador Haar de faces carregado")
+            logger.info("✅ Classificador Haar de faces (alt2) carregado")
         except Exception as e:
             logger.error(f"❌ Erro ao carregar classificador Haar de faces: {e}")
             _face_cascade = None
@@ -325,7 +325,7 @@ def validate_face_authenticity(face_rgb: np.ndarray) -> ValidationResult:
             confidence=0.0
         )
 
-def detect_and_validate_faces(rgb_image: np.ndarray) -> List[Tuple[np.ndarray, ValidationResult]]:
+def detect_and_validate_faces(rgb_image: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], np.ndarray, ValidationResult]]:
     """Detecta e valida rostos usando OpenCV Haar Cascades"""
     try:
         face_cascade = get_face_cascade()
@@ -364,7 +364,7 @@ def detect_and_validate_faces(rgb_image: np.ndarray) -> List[Tuple[np.ndarray, V
                 validation = validate_face_authenticity(face_crop)
                 
                 if validation.is_valid:
-                    validated_faces.append((face_crop, validation))
+                    validated_faces.append(((x, y, w, h), face_crop, validation))
                     logger.info(f"✅ Rosto {i} validado: {face_crop.shape} - confiança: {validation.confidence:.3f}")
                 else:
                     logger.warning(f"❌ Rosto {i} rejeitado: {validation.reason.value} - {validation.details}")
@@ -423,6 +423,55 @@ def assess_face_quality(face_rgb: np.ndarray) -> QualityMetrics:
 
 class EmbeddingExtractor:
     """Classe responsável pela extração de embeddings faciais"""
+    
+    @staticmethod
+    def compute_hog_features(face_gray: np.ndarray, cell_size: int = 16, block_size: int = 1, nbins: int = 9) -> np.ndarray:
+        """Implementação personalizada de HOG usando apenas OpenCV"""
+        try:
+            height, width = face_gray.shape
+            
+            # Calcular gradientes
+            grad_x = cv2.Sobel(face_gray, cv2.CV_32F, 1, 0, ksize=1)
+            grad_y = cv2.Sobel(face_gray, cv2.CV_32F, 0, 1, ksize=1)
+            
+            # Magnitude e orientação
+            magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            orientation = np.arctan2(grad_y, grad_x) * 180 / np.pi
+            orientation[orientation < 0] += 180  # 0-180 graus
+            
+            # Número de células
+            cells_x = width // cell_size
+            cells_y = height // cell_size
+            
+            hog_features = []
+            
+            for cy in range(cells_y):
+                for cx in range(cells_x):
+                    # Limites da célula
+                    x1 = cx * cell_size
+                    y1 = cy * cell_size
+                    x2 = min(x1 + cell_size, width)
+                    y2 = min(y1 + cell_size, height)
+                    
+                    # Extrair magnitude e orientação da célula
+                    cell_mag = magnitude[y1:y2, x1:x2]
+                    cell_ori = orientation[y1:y2, x1:x2]
+                    
+                    # Histograma de orientação
+                    hist, _ = np.histogram(
+                        cell_ori.flatten(),
+                        bins=nbins,
+                        range=(0, 180),
+                        weights=cell_mag.flatten()
+                    )
+                    
+                    hog_features.extend(hist)
+            
+            return np.array(hog_features, dtype=np.float32)
+            
+        except Exception as e:
+            logger.warning(f"Erro no cálculo de HOG personalizado: {e}")
+            return np.array([0.0] * (nbins * 16), dtype=np.float32)  # Fallback
     
     @staticmethod
     def extract_visual_features(face_gray: np.ndarray) -> np.ndarray:
@@ -495,6 +544,53 @@ class EmbeddingExtractor:
         
         features.extend([symmetry_diff, symmetry_corr])
         
+        # 6. HOG personalizado (sem scikit-image)
+        try:
+            hog_features = EmbeddingExtractor.compute_hog_features(face_gray)
+            features.extend(hog_features)
+            logger.debug(f"HOG features extraídas: {len(hog_features)}")
+        except Exception as e:
+            logger.warning(f"Falha ao calcular HOG personalizado: {e}")
+            # Adiciona zeros como fallback
+            features.extend([0.0] * 144)  # 9 bins * 16 células
+        
+        # 7. Características adicionais de textura usando OpenCV
+        try:
+            # Filtros Gabor
+            for theta in [0, 45, 90, 135]:
+                kernel = cv2.getGaborKernel((21, 21), 5, np.radians(theta), 2*np.pi*0.5, 0.5, 0, ktype=cv2.CV_32F)
+                gabor_response = cv2.filter2D(face_gray, cv2.CV_8UC3, kernel)
+                features.extend([
+                    np.mean(gabor_response),
+                    np.std(gabor_response),
+                    np.max(gabor_response),
+                    np.min(gabor_response)
+                ])
+        except Exception as e:
+            logger.warning(f"Falha ao calcular filtros Gabor: {e}")
+            features.extend([0.0] * 16)  # 4 orientações * 4 estatísticas
+        
+        # 8. Características de canto e bordas
+        try:
+            # Detecção de cantos Harris
+            corners = cv2.cornerHarris(face_gray, 2, 3, 0.04)
+            features.extend([
+                np.sum(corners > 0.01 * corners.max()),  # Número de cantos
+                np.mean(corners),
+                np.std(corners)
+            ])
+            
+            # Detector de bordas Canny
+            edges = cv2.Canny(face_gray, 50, 150)
+            features.extend([
+                np.sum(edges > 0) / (face_gray.shape[0] * face_gray.shape[1]),  # Densidade de bordas
+                np.mean(edges),
+                np.std(edges)
+            ])
+        except Exception as e:
+            logger.warning(f"Falha ao calcular características de canto/bordas: {e}")
+            features.extend([0.0] * 6)
+        
         return np.array(features, dtype=np.float32)
     
     @staticmethod
@@ -557,10 +653,10 @@ def extract_embedding_from_image(rgb_image: np.ndarray) -> Optional[Dict[str, An
             return None
         
         # Seleciona o melhor rosto (maior área e melhor validação)
-        best_face, best_validation = max(
+        best_face = max(
             validated_faces, 
-            key=lambda x: x[0].shape[0] * x[0].shape[1] * x[1].confidence
-        )
+            key=lambda x: x[1].shape[0] * x[1].shape[1] * x[2].confidence
+        )[1]  # Pega apenas a face crop (índice 1)
         
         # Avalia qualidade
         quality = assess_face_quality(best_face)
@@ -578,6 +674,7 @@ def extract_embedding_from_image(rgb_image: np.ndarray) -> Optional[Dict[str, An
         # Preprocessa face
         face_resized = cv2.resize(best_face, (Config.FACE_SIZE, Config.FACE_SIZE))
         face_gray = cv2.cvtColor(face_resized, cv2.COLOR_RGB2GRAY)
+        face_gray = cv2.equalizeHist(face_gray)
         
         # Extrai características
         features = EmbeddingExtractor.extract_visual_features(face_gray)
@@ -591,7 +688,6 @@ def extract_embedding_from_image(rgb_image: np.ndarray) -> Optional[Dict[str, An
         result = {
             "embedding": embedding,
             "quality": quality,
-            "validation": best_validation,
             "face_shape": best_face.shape
         }
         
@@ -753,9 +849,9 @@ def health_check():
         eye_cascade = get_eye_cascade()
         
         health_data = {
-            "face_detection": "✅ OpenCV Haar Cascades" if face_cascade else "❌ Não disponível",
+            "face_detection": "✅ OpenCV Haar Cascades (alt2)" if face_cascade else "❌ Não disponível",
             "eye_detection": "✅ Detecção de olhos" if eye_cascade else "❌ Não disponível",
-            "embedding_method": "Features visuais aprimoradas",
+            "embedding_method": "Features visuais aprimoradas + HOG personalizado + Filtros Gabor",
             "embedding_dimensions": Config.EMBEDDING_DIMENSIONS,
             "cache_size": len(driver_embedding_cache),
             "similarity_history_size": len(similarity_history),
@@ -777,9 +873,9 @@ def health_check():
 
 @app.route("/verify_driver", methods=["POST"])
 def verify_driver():
-    """Endpoint principal de verificação de motorista"""
+    """Endpoint principal de verificação de motorista (versão com múltiplas faces)"""
     try:
-        # Validação da requisição
+        # --- 1. Validação da Requisição ---
         payload = request.get_json(silent=True)
         if not payload:
             return create_error_response("Payload JSON inválido", 400)
@@ -796,126 +892,128 @@ def verify_driver():
 
         logger.info(f"🚗 Verificação do carro {car_id} com {len(authorized_drivers)} motoristas")
 
-        # Processamento da imagem
+        # --- 2. Processamento da Imagem de Entrada ---
         try:
             rgb_image = validate_image_input(image_data)
+            # Criar cópia para anotação (OpenCV usa BGR)
+            annotated_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
             logger.info(f"🖼️ Imagem processada: {rgb_image.shape}")
         except ValueError as e:
             return create_error_response(str(e), 400)
 
-        # Extração de embedding da captura
-        embedding_result = extract_embedding_from_image(rgb_image)
-        if not embedding_result or embedding_result["embedding"] is None:
-            return create_success_response({
-                "authorized": False,
-                "driver_id": None,
-                "driver_name": "Desconhecido",
-                "confidence": 0,
-                "confidence_level": "baixa",
-                "quality_recommendation": "Posicione o rosto de frente para a câmera com boa iluminação. Certifique-se de que ambos os olhos estão visíveis."
-            }, "Nenhum rosto válido detectado na captura")
-
-        query_embedding = embedding_result["embedding"]
-
-        # Processamento dos motoristas autorizados
+        # --- 3. Processamento dos Motoristas Autorizados (Cache) ---
         known_embeddings, id_name_pairs = process_driver_embeddings(authorized_drivers)
         if not known_embeddings:
             return create_success_response({
                 "authorized": False,
-                "driver_id": None,
-                "driver_name": "Desconhecido",
-                "confidence": 0,
-                "confidence_level": "baixa"
-            }, "Nenhum motorista autorizado válido encontrado")
+                "message": "Nenhum motorista autorizado válido foi processado."
+            }, "Lista de motoristas autorizados vazia ou inválida")
 
-        # Cálculo de similaridades
-        similarities = [
-            calculate_cosine_similarity(query_embedding, emb) 
-            for emb in known_embeddings
-        ]
+        # --- 4. Detecção e Loop por Todas as Faces ---
+        all_detected_faces = detect_and_validate_faces(rgb_image)
+        detection_results = []
+        unknown_detected = False
         
-        best_idx = int(np.argmax(similarities))
-        best_similarity = float(similarities[best_idx])
-        best_driver_id, best_driver_name = id_name_pairs[best_idx]
+        if not all_detected_faces:
+             return create_success_response({
+                "detections": [],
+                "car_id": car_id,
+                "authorized_count": 0,
+                "unknown_count": 0
+            }, "Nenhum rosto válido detectado na captura")
 
-        # Atualização do histórico
-        similarity_history.append(best_similarity)
-        if len(similarity_history) > Config.MAX_SIMILARITY_HISTORY:
-            similarity_history.pop(0)
-
-        # Cálculo de thresholds dinâmicos
+        # Calcula thresholds uma vez
         th_strict, th_loose = calculate_dynamic_thresholds()
-
-        # Logs detalhados
-        logger.info("🔍 Similaridades calculadas:")
-        for sim, (driver_id, driver_name) in zip(similarities, id_name_pairs):
-            logger.info(f"   {driver_name}: {sim:.6f}")
         
-        logger.info(f"🎯 Melhor match: {best_driver_name} com {best_similarity:.6f}")
-        logger.info(f"📏 Thresholds: Strict={th_strict:.3f}, Loose={th_loose:.3f}")
+        for (x, y, w, h), face_crop, validation in all_detected_faces:
+            
+            # a. Avalia qualidade
+            quality = assess_face_quality(face_crop)
+            if quality.overall < Config.MIN_QUALITY_SCORE:
+                logger.warning(f"Rosto em {(x,y)} pulado por baixa qualidade: {quality.overall:.3f}")
+                continue
 
-        # Determinação de autorização
-        authorized = best_similarity >= th_loose
-        confidence_level = (
-            "alta" if best_similarity >= th_strict else 
-            "moderada" if authorized else 
-            "baixa"
-        )
-        
-        # Geração de recomendações
-        recommendations = []
-        if not authorized:
-            if best_similarity > 0.5:
-                recommendations.extend([
-                    "Melhore a iluminação do ambiente",
-                    "Posicione o rosto completamente de frente para a câmera",
-                    "Remova óculos escuros ou acessórios que cubram o rosto",
-                    "Certifique-se de que ambos os olhos estão claramente visíveis"
-                ])
-            elif best_similarity > 0.3:
-                recommendations.extend([
-                    "Verifique se você está cadastrado como motorista autorizado",
-                    "Tente uma nova captura com melhor qualidade"
-                ])
-            else:
-                recommendations.extend([
-                    "Pessoa não reconhecida no sistema",
-                    "Verifique se o cadastro foi realizado corretamente"
-                ])
+            # b. Extrai embedding da face atual (lógica similar a extract_embedding_from_image)
+            face_resized = cv2.resize(face_crop, (Config.FACE_SIZE, Config.FACE_SIZE))
+            face_gray = cv2.cvtColor(face_resized, cv2.COLOR_RGB2GRAY)
+            face_gray = cv2.equalizeHist(face_gray) # Melhoria de acurácia
+            
+            features = EmbeddingExtractor.extract_visual_features(face_gray)
+            query_embedding = EmbeddingExtractor.normalize_embedding(features)
 
-        # Resposta final
-        verification_data = {
-            "authorized": authorized,
-            "driver_id": best_driver_id if authorized else None,
-            "driver_name": best_driver_name if authorized else "Desconhecido",
-            "confidence": round(best_similarity * 100, 1),
-            "confidence_level": confidence_level,
-            "thresholds": {"strict": th_strict, "loose": th_loose},
-            "recommendations": recommendations,
-            "all_similarities": [
-                {"name": name, "similarity": round(sim, 6)} 
-                for sim, (_, name) in zip(similarities, id_name_pairs)
-            ],
-            "system_info": {
-                "min_confidence_threshold": Config.MIN_CONFIDENCE_THRESHOLD,
-                "min_quality_score": Config.MIN_QUALITY_SCORE,
-                "embedding_dimensions": len(query_embedding),
-                "face_quality": {
-                    "overall": round(embedding_result["quality"].overall, 3),
-                    "brightness": round(embedding_result["quality"].brightness, 3),
-                    "contrast": round(embedding_result["quality"].contrast, 3),
-                    "sharpness": round(embedding_result["quality"].sharpness, 3)
+            if query_embedding is None:
+                logger.warning(f"Rosto em {(x,y)} pulado (falha ao gerar embedding)")
+                continue
+                
+            # c. Compara com motoristas conhecidos
+            similarities = [
+                calculate_cosine_similarity(query_embedding, emb) 
+                for emb in known_embeddings
+            ]
+            
+            best_idx = int(np.argmax(similarities))
+            best_similarity = float(similarities[best_idx])
+            best_driver_id, best_driver_name = id_name_pairs[best_idx]
+            
+            # d. Decide autorização e anota
+            authorized = best_similarity >= th_loose
+            
+            if authorized:
+                label = best_driver_name
+                color = (0, 255, 0) # Verde
+                result_data = {
+                    "authorized": True, 
+                    "driver_id": best_driver_id, 
+                    "driver_name": label, 
+                    "confidence": round(best_similarity * 100, 1)
                 }
-            }
+            else:
+                label = "Desconhecido"
+                color = (0, 0, 255) # Vermelho
+                result_data = {
+                    "authorized": False, 
+                    "driver_id": None, 
+                    "driver_name": label, 
+                    "confidence": round(best_similarity * 100, 1)
+                }
+                unknown_detected = True
+                logger.warning(
+                    f'ALERTA: Pessoa desconhecida detectada em {(x,y)}! '
+                    f'Melhor match: {best_driver_name} (Similaridade: {best_similarity:.4f} < {th_loose:.4f})'
+                )
+
+            detection_results.append(result_data)
+            
+            # e. Desenha na imagem de anotação
+            cv2.rectangle(annotated_image, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(annotated_image, f"{label} ({best_similarity:.2f})", (x, y - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # --- 5. Salvar Log se Desconhecido for Detectado ---
+        if unknown_detected:
+            try:
+                log_dir = 'logs'
+                os.makedirs(log_dir, exist_ok=True)
+                log_image_path = os.path.join(log_dir, f'unknown_detection_car_{car_id}_{int(time.time())}.jpg')
+                cv2.imwrite(log_image_path, annotated_image)
+                logger.warning(f'Imagem de registro de desconhecido salva em: {log_image_path}')
+            except Exception as log_e:
+                logger.error(f"Falha ao salvar imagem de log: {log_e}")
+
+        # --- 6. Resposta Final ---
+        authorized_count = sum(1 for r in detection_results if r['authorized'])
+        unknown_count = len(detection_results) - authorized_count
+        
+        final_response_data = {
+            "detections": detection_results,
+            "car_id": car_id,
+            "authorized_count": authorized_count,
+            "unknown_count": unknown_count,
+            "thresholds": {"strict": th_strict, "loose": th_loose}
         }
-
-        message = (
-            f"Motorista {best_driver_name} autorizado com {confidence_level} confiança" 
-            if authorized else 
-            f"Acesso negado. Similaridade insuficiente: {best_similarity:.3f} (necessário: ≥{th_loose:.3f})"
-        )
-
-        return create_success_response(verification_data, message)
+        
+        message = f"Verificação concluída: {authorized_count} autorizado(s), {unknown_count} desconhecido(s)."
+        return create_success_response(final_response_data, message)
 
     except Exception as e:
         logger.error(f"❌ Erro na verificação: {str(e)}")
@@ -945,8 +1043,8 @@ def internal_error(error):
 def initialize_system():
     """Inicializa os componentes do sistema"""
     logger.info(f"🚀 Iniciando AutoGuard Vision Backend...")
-    logger.info(f"🔍 Detecção facial: OpenCV Haar Cascades com validação aprimorada")
-    logger.info(f"🧠 Método de embedding: Features visuais aprimoradas ({Config.EMBEDDING_DIMENSIONS}D)")
+    logger.info(f"🔍 Detecção facial: OpenCV Haar Cascades (alt2) com validação aprimorada")
+    logger.info(f"🧠 Método de embedding: Features visuais aprimoradas + HOG personalizado + Filtros Gabor ({Config.EMBEDDING_DIMENSIONS}D)")
     logger.info(f"📊 Configurações: Min. Confiança={Config.MIN_CONFIDENCE_THRESHOLD}, Min. Qualidade={Config.MIN_QUALITY_SCORE}")
     
     # Testa componentes críticos

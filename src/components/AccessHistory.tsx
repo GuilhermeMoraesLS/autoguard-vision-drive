@@ -7,6 +7,7 @@ export interface AccessRecord {
   driver: string;
   status: "authorized" | "unauthorized";
   timestamp: string;
+  confidence?: number;
 }
 
 interface AccessHistoryProps {
@@ -29,6 +30,7 @@ export const AccessHistory = ({ records }: AccessHistoryProps) => {
               <TableRow className="border-border hover:bg-secondary/50">
                 <TableHead className="text-foreground font-semibold">Motorista</TableHead>
                 <TableHead className="text-foreground font-semibold">Status</TableHead>
+                <TableHead className="text-foreground font-semibold">Confiança</TableHead>
                 <TableHead className="text-foreground font-semibold">Data/Hora</TableHead>
               </TableRow>
             </TableHeader>
@@ -52,6 +54,9 @@ export const AccessHistory = ({ records }: AccessHistoryProps) => {
                         </>
                       )}
                     </div>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {record.confidence ? `${record.confidence.toFixed(1)}%` : 'N/A'}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {record.timestamp}

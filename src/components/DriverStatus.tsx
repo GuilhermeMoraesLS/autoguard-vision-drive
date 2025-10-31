@@ -1,13 +1,25 @@
-import { CheckCircle2, XCircle, Clock } from "lucide-react";
+import { CheckCircle2, XCircle, Clock, Users, User } from "lucide-react";
 import { Card } from "@/components/ui/card";
 
 interface DriverStatusProps {
   authorized: boolean | null;
   driverName: string;
   timestamp: string;
+  confidence?: number;
+  totalDetections?: number;
+  authorizedCount?: number;
+  unknownCount?: number;
 }
 
-export const DriverStatus = ({ authorized, driverName, timestamp }: DriverStatusProps) => {
+export const DriverStatus = ({ 
+  authorized, 
+  driverName, 
+  timestamp, 
+  confidence,
+  totalDetections,
+  authorizedCount,
+  unknownCount
+}: DriverStatusProps) => {
   if (authorized === null) {
     return (
       <Card className="p-6 bg-card border-border">
@@ -18,7 +30,7 @@ export const DriverStatus = ({ authorized, driverName, timestamp }: DriverStatus
           <div>
             <h3 className="text-lg font-semibold text-foreground">Aguardando Verificação</h3>
             <p className="text-sm text-muted-foreground mt-1">
-              Capture uma imagem para identificar o motorista
+              Capture uma imagem para identificar o(s) motorista(s)
             </p>
           </div>
         </div>
@@ -50,8 +62,13 @@ export const DriverStatus = ({ authorized, driverName, timestamp }: DriverStatus
                 ? "bg-success text-success-foreground" 
                 : "bg-danger text-danger-foreground"
             }`}>
-              {authorized ? "AUTORIZADO" : "DESCONHECIDO"}
+              {authorized ? "✅ AUTORIZADO" : "❌ NÃO AUTORIZADO"}
             </div>
+            {confidence !== undefined && (
+              <div className="px-2 py-1 bg-secondary rounded-full text-xs text-muted-foreground">
+                {confidence.toFixed(1)}%
+              </div>
+            )}
           </div>
           
           <div>
@@ -61,6 +78,38 @@ export const DriverStatus = ({ authorized, driverName, timestamp }: DriverStatus
               <span>{timestamp}</span>
             </div>
           </div>
+
+          {/* Informações detalhadas das detecções */}
+          {totalDetections !== undefined && totalDetections > 0 && (
+            <div className="mt-4 p-3 bg-secondary/30 rounded-lg space-y-2">
+              <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <Users className="w-4 h-4" />
+                <span>Detecções: {totalDetections} pessoa{totalDetections > 1 ? 's' : ''}</span>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-3">
+                {authorizedCount !== undefined && authorizedCount > 0 && (
+                  <div className="flex items-center gap-2 text-sm">
+                    <div className="w-3 h-3 rounded-full bg-success"></div>
+                    <span className="text-foreground font-medium">{authorizedCount} Autorizado{authorizedCount > 1 ? 's' : ''}</span>
+                  </div>
+                )}
+                
+                {unknownCount !== undefined && unknownCount > 0 && (
+                  <div className="flex items-center gap-2 text-sm">
+                    <div className="w-3 h-3 rounded-full bg-danger"></div>
+                    <span className="text-foreground font-medium">{unknownCount} Desconhecido{unknownCount > 1 ? 's' : ''}</span>
+                  </div>
+                )}
+              </div>
+              
+              {confidence !== undefined && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground pt-1 border-t border-border">
+                  <span>Confiança máxima detectada: {confidence.toFixed(1)}%</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </Card>
