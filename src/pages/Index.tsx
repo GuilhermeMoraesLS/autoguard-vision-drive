@@ -5,7 +5,8 @@ import { useAuth } from "@/contexts/AuthContext";
 import { CameraCapture } from "@/components/CameraCapture";
 import { DriverStatus } from "@/components/DriverStatus";
 import { AccessHistory, AccessRecord } from "@/components/AccessHistory";
-import { Shield, ArrowLeft, LogOut } from "lucide-react";
+import { FaceVerificationVisualizer } from "@/components/FaceVerificationVisualizer";
+import { Shield, ArrowLeft, LogOut, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
@@ -28,6 +29,10 @@ interface DetectionResult {
   driver_id: string | null;
   driver_name: string;
   confidence: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
 }
 
 interface ApiResponse {
@@ -41,6 +46,15 @@ interface ApiResponse {
     strict: number;
     loose: number;
   };
+  performance?: {
+    faces_processed: number;
+    cache_hits: number;
+    unique_identifications: number;
+  };
+  image_dimensions?: {
+    width: number;
+    height: number;
+  };
 }
 
 const Index = () => {
@@ -51,6 +65,12 @@ const Index = () => {
   const [authorizedDrivers, setAuthorizedDrivers] = useState<AuthorizedDriver[]>([]);
   const [isLoadingCar, setIsLoadingCar] = useState(true);
   const [isVerifying, setIsVerifying] = useState(false);
+  
+  // ✅ Estados para exibir resultado
+  const [verificationResult, setVerificationResult] = useState<ApiResponse | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string>("");
+  const [showResult, setShowResult] = useState(false);
+  
   const [currentDriver, setCurrentDriver] = useState<{
     authorized: boolean | null;
     name: string;
@@ -84,25 +104,16 @@ const Index = () => {
 
         setCar(carData);
 
-        // Buscar motoristas autorizados
+        // ✅ Buscar motoristas autorizados diretamente da tabela authorized_drivers
         const { data: driversData, error: driversError } = await supabase
-          .from("car_drivers")
-          .select(`
-            drivers (
-              id,
-              name,
-              photo_url
-            )
-          `)
+          .from("authorized_drivers")
+          .select("id, name, photo_url")
           .eq("car_id", carId);
 
         if (driversError) throw driversError;
 
-        const drivers = driversData
-          ?.map((item) => item.drivers)
-          .filter(Boolean) as AuthorizedDriver[];
-
-        setAuthorizedDrivers(drivers || []);
+        setAuthorizedDrivers(driversData || []);
+        
       } catch (error) {
         console.error("Erro ao buscar dados:", error);
         toast.error("Erro ao carregar dados do veículo");
@@ -118,12 +129,10 @@ const Index = () => {
   const handleCapture = async (imageData: string) => {
     console.log("🔄 Iniciando verificação...");
     
-    console.log("📊 Dados disponíveis:", {
-      carId,
-      authorizedDriversCount: authorizedDrivers.length,
-      backendUrl: import.meta.env.VITE_BACKEND_URL
-    });
-
+    // ✅ IMPORTANTE: Armazena a imagem capturada PRIMEIRO
+    setCapturedImage(imageData);
+    console.log("📸 Imagem capturada e armazenada:", imageData.substring(0, 50) + "...");
+    
     if (!carId) {
       console.error("❌ Erro: carId não informado");
       toast.error("Carro não informado");
@@ -154,11 +163,7 @@ const Index = () => {
         }))
       };
 
-      console.log("📤 Enviando requisição:", {
-        url: `${backendBaseUrl}/verify_driver`,
-        driversCount: requestData.authorized_drivers.length,
-        carId: requestData.car_id
-      });
+      console.log("📤 Enviando requisição para API...");
 
       const response = await fetch(`${backendBaseUrl}/verify_driver`, {
         method: "POST",
@@ -166,12 +171,6 @@ const Index = () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(requestData),
-      });
-
-      console.log("📥 Resposta recebida:", {
-        status: response.status,
-        statusText: response.statusText,
-        ok: response.ok
       });
 
       if (!response.ok) {
@@ -183,6 +182,11 @@ const Index = () => {
 
       const result: ApiResponse = await response.json();
       console.log("📊 Resultado completo da API:", result);
+
+      // ✅ IMPORTANTE: Armazena resultado E mostra a tela de resultado
+      setVerificationResult(result);
+      setShowResult(true); // garante que a tela mude para o resultado
+      console.log("✅ Resultado armazenado e showResult definido como true");
 
       // Processar múltiplas detecções
       const timestamp = new Date().toLocaleString("pt-BR");
@@ -234,8 +238,6 @@ const Index = () => {
         // Adicionar no topo do histórico
         setAccessHistory((prev) => [...newRecords, ...prev].slice(0, 50));
 
-        console.log("📋 Novos registros adicionados ao histórico:", newRecords);
-
         // Mostrar notificação com resumo
         if (result.authorized_count > 0) {
           toast.success(`✅ ${result.authorized_count} motorista(s) autorizado(s) detectado(s)`, {
@@ -268,11 +270,6 @@ const Index = () => {
 
     } catch (error) {
       console.error("❌ Erro na verificação:", error);
-      console.error("📋 Detalhes do erro:", {
-        message: error instanceof Error ? error.message : "Erro desconhecido",
-        stack: error instanceof Error ? error.stack : undefined
-      });
-      
       toast.error(`❌ Erro ao verificar: ${error instanceof Error ? error.message : "Erro desconhecido"}`);
       setCurrentDriver({ 
         authorized: false, 
@@ -282,6 +279,14 @@ const Index = () => {
     } finally {
       setIsVerifying(false);
     }
+  };
+
+  // ✅ Função para limpar resultado e voltar à câmera
+  const clearResult = () => {
+    console.log("🔄 Limpando resultado e voltando para câmera");
+    setShowResult(false);
+    setVerificationResult(null);
+    setCapturedImage("");
   };
 
   if (!user || isLoadingCar) {
@@ -296,10 +301,18 @@ const Index = () => {
     return null;
   }
 
+  // ✅ Debug: Log dos estados atuais
+  console.log("🎯 Estado atual:", {
+    showResult,
+    hasVerificationResult: !!verificationResult,
+    hasCapturedImage: !!capturedImage,
+    isVerifying
+  });
+
   return (
     <div className="min-h-screen bg-gradient-dark">
       {/* Header */}
-      <header className="border-b border-border bg-card/50 backdrop-blur-sm">
+      <header className="bg-card border-b border-border">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -338,15 +351,63 @@ const Index = () => {
       {/* Main Content */}
       <main className="container mx-auto px-4 py-8">
         <div className="grid lg:grid-cols-2 gap-8">
-          {/* Left Column - Camera */}
+          {/* Left Column - Camera ou Resultado */}
           <div className="space-y-6">
-            <div>
-              <h2 className="text-xl font-bold text-foreground mb-2">Captura de Imagem</h2>
-              <p className="text-sm text-muted-foreground">
-                Posicione o(s) motorista(s) em frente à câmera e clique em "Verificar Motorista"
-              </p>
-            </div>
-            <CameraCapture onCapture={handleCapture} isVerifying={isVerifying} />
+            {!showResult ? (
+              // ✅ Tela de Captura de Câmera
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-xl font-bold text-foreground">Captura de Imagem</h2>
+                  {capturedImage && (
+                    <Button
+                      onClick={() => setShowResult(true)}
+                      variant="outline"
+                      size="sm"
+                    >
+                      Ver Último Resultado
+                    </Button>
+                  )}
+                </div>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Posicione o(s) motorista(s) em frente à câmera e clique em "Verificar Motorista"
+                </p>
+                <CameraCapture onCapture={handleCapture} isVerifying={isVerifying} />
+              </div>
+            ) : (
+              // ✅ Tela de Resultado da Verificação
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-xl font-bold text-foreground">Resultado da Verificação</h2>
+                  <Button
+                    onClick={clearResult}
+                    variant="secondary"
+                    size="sm"
+                    disabled={isVerifying}
+                  >
+                    <RotateCcw className="w-4 h-4 mr-2" />
+                    Nova Verificação
+                  </Button>
+                </div>
+                
+                {/* ✅ IMPORTANTE: Verificação de dados antes de renderizar */}
+                {verificationResult && capturedImage ? (
+                  <FaceVerificationVisualizer
+                    imageData={capturedImage}
+                    verificationResult={verificationResult}
+                    isLoading={isVerifying}
+                  />
+                ) : (
+                  <div className="p-8 text-center bg-card rounded-lg border">
+                    <p className="text-muted-foreground">
+                      {!capturedImage ? "Imagem não disponível" : "Resultado não disponível"}
+                    </p>
+                    <Button onClick={clearResult} className="mt-4">
+                      Voltar para Câmera
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Right Column - Status & Info */}
@@ -375,31 +436,47 @@ const Index = () => {
               {authorizedDrivers.length > 0 ? (
                 <div className="space-y-2">
                   {authorizedDrivers.slice(0, 3).map((driver) => (
-                    <div key={driver.id} className="flex items-center gap-2 p-2 bg-secondary/30 rounded-lg">
-                      <img 
-                        src={driver.photo_url} 
-                        alt={driver.name}
-                        className="w-8 h-8 rounded-full object-cover"
-                      />
-                      <span className="text-sm text-foreground">{driver.name}</span>
+                    <div
+                      key={driver.id}
+                      className="flex items-center gap-3 p-3 bg-card rounded-lg border border-border"
+                    >
+                      <div className="w-10 h-10 rounded-full bg-gradient-primary flex items-center justify-center">
+                        <span className="text-primary-foreground text-sm font-bold">
+                          {driver.name.charAt(0).toUpperCase()}
+                        </span>
+                      </div>
+                      <div className="flex-1">
+                        <p className="font-medium text-sm text-foreground">{driver.name}</p>
+                        <p className="text-xs text-muted-foreground">Motorista Autorizado</p>
+                      </div>
                     </div>
                   ))}
                   {authorizedDrivers.length > 3 && (
-                    <p className="text-xs text-muted-foreground">
-                      +{authorizedDrivers.length - 3} outros...
+                    <p className="text-xs text-muted-foreground text-center">
+                      +{authorizedDrivers.length - 3} motorista(s) adicional(is)
                     </p>
                   )}
                 </div>
               ) : (
-                <p className="text-sm text-muted-foreground">Nenhum motorista cadastrado</p>
+                <div className="text-center p-6 bg-card rounded-lg border border-border">
+                  <p className="text-muted-foreground text-sm">Nenhum motorista cadastrado</p>
+                  <Button
+                    onClick={() => navigate(`/cars/${carId}/drivers/new`)}
+                    className="mt-2"
+                    size="sm"
+                  >
+                    Cadastrar Primeiro Motorista
+                  </Button>
+                </div>
               )}
             </div>
-          </div>
-        </div>
 
-        {/* History Table - Full Width */}
-        <div className="mt-8">
-          <AccessHistory records={accessHistory} />
+            {/* Histórico de Acesso */}
+            <div>
+              <h3 className="text-lg font-semibold text-foreground mb-2">Histórico de Acesso</h3>
+              <AccessHistory records={accessHistory} />
+            </div>
+          </div>
         </div>
       </main>
     </div>

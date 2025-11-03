@@ -12,6 +12,7 @@ import CarDetails from "./pages/CarDetails";
 import NewDriver from "./pages/NewDriver";
 import NotFound from "./pages/NotFound";
 import TestApi from "./pages/TestApi";
+import FaceVerification from "@/pages/FaceVerification";
 
 const queryClient = new QueryClient();
 
@@ -28,7 +29,7 @@ const App = () => (
             <Route path="/verify" element={<Index />} />
             <Route path="/cars/new" element={<NewCar />} />
             <Route path="/cars/:id" element={<CarDetails />} />
-            <Route path="/cars/:id/verify" element={<Index />} />
+            <Route path="/cars/:id/verify" element={<FaceVerification />} />
             <Route path="/cars/:id/drivers/new" element={<NewDriver />} />
             <Route path="/test-api" element={<TestApi />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
