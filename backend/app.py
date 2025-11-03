@@ -18,6 +18,7 @@ from enum import Enum
 import statistics
 import threading
 import sys
+import urllib.request
 
 import cv2
 import numpy as np
@@ -67,8 +68,13 @@ class Config:
 
     # --- Similaridade / decisão ---
     MIN_DECISION_MARGIN = 0.08
-    MIN_STRICT_THRESHOLD = 0.92
-    MIN_LOOSE_THRESHOLD = 0.86
+    MIN_STRICT_THRESHOLD = 0.89   # ↓
+    MIN_LOOSE_THRESHOLD  = 0.83   # ↓
+
+    # Fallback “no-quase”
+    ENABLE_FALLBACK_RECHECK = True
+    FALLBACK_THRESHOLD = 0.835    # ↓ aceita 83.5% na rechecagem
+    FALLBACK_MARGIN = 0.10          # exige Δ >= 0.10 no fallback
 
     # --- Paralelismo / runtime (faltavam) ---
     MAX_PARALLEL_FACES = 4
@@ -731,9 +737,6 @@ def calculate_cosine_similarity_cached(v1: np.ndarray, v2: np.ndarray, cache_key
         return 0.0
 
 def calculate_dynamic_thresholds_fast() -> tuple[float, float]:
-    """
-    Thresholds mais rigorosos com piso mínimo alto.
-    """
     try:
         if len(similarity_history) < 10:
             return max(0.94, Config.MIN_STRICT_THRESHOLD), max(0.88, Config.MIN_LOOSE_THRESHOLD)
@@ -741,7 +744,7 @@ def calculate_dynamic_thresholds_fast() -> tuple[float, float]:
         mean = float(np.mean(recent))
         std = float(np.std(recent))
         strict = max(Config.MIN_STRICT_THRESHOLD, min(0.98, mean + 1.0 * std))
-        loose = max(Config.MIN_LOOSE_THRESHOLD, min(0.95, mean + 0.3 * std))
+        loose  = max(Config.MIN_LOOSE_THRESHOLD,  min(0.95, mean + 0.3 * std))
         return strict, loose
     except Exception:
         return Config.MIN_STRICT_THRESHOLD, Config.MIN_LOOSE_THRESHOLD
@@ -750,85 +753,42 @@ def calculate_dynamic_thresholds_fast() -> tuple[float, float]:
 # PROCESSAMENTO DE MOTORISTAS OTIMIZADO
 # =====================================================
 
-def process_driver_embeddings_parallel(drivers: List[dict]) -> Tuple[List[np.ndarray], List[Tuple[str, str]]]:
-    """Processamento paralelo de embeddings de motoristas"""
-    final_embeddings: List[np.ndarray] = []
+def process_driver_embeddings_parallel(authorized_drivers) -> Tuple[List[np.ndarray], List[Tuple[str, str]]]:
+    """
+    Constrói (known_embeddings, id_name_pairs) com template robusto para cada motorista.
+    """
+    known_embeddings: List[np.ndarray] = []
     id_name_pairs: List[Tuple[str, str]] = []
 
-    # Limpa cache de IDs não presentes
-    incoming_ids = {d.get("id") for d in drivers if d.get("id")}
-    for driver_id in list(optimized_cache.driver_embeddings.keys()):
-        if driver_id not in incoming_ids:
-            del optimized_cache.driver_embeddings[driver_id]
-
-    def process_single_driver(driver_data):
-        driver_id = driver_data.get("id")
-        name = driver_data.get("name")
-        photo_url = driver_data.get("photo_url")
-        
-        if not all([driver_id, name, photo_url]):
-            return None
-
+    def build_one(drv):
         try:
-            # Verifica cache
-            cached_embeddings = optimized_cache.get_driver_embedding(driver_id)
-            
-            if cached_embeddings is None:
-                # Download com timeout reduzido
-                response = requests.get(photo_url, timeout=Config.REQUEST_TIMEOUT)
-                response.raise_for_status()
-                
-                # Processamento otimizado
-                nparr = np.frombuffer(response.content, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if img is None:
-                    return None
-                
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                
-                # Detecção rápida de uma face principal
-                faces = detect_and_validate_faces_parallel(img_rgb)
-                if faces:
-                    face_crop = faces[0][1]  # Pega a primeira face válida
-                    embedding = extract_embedding_optimized(face_crop)
-                    
-                    if embedding is not None:
-                        optimized_cache.set_driver_embedding(driver_id, [embedding])
-                        return (embedding, (driver_id, name))
-                
+            emb = compute_driver_template_embedding(drv["photo_url"])
+            if emb is None:
+                logger.warning(f"⚠️ embedding vazio para {drv.get('name')}")
                 return None
-            else:
-                # Usa embedding cacheado
-                if len(cached_embeddings) > 1:
-                    # Média ponderada rápida
-                    weights = np.exp(np.linspace(-0.5, 0, len(cached_embeddings)))
-                    weights = weights / np.sum(weights)
-                    embedding = np.average(cached_embeddings, axis=0, weights=weights)
-                    embedding = embedding / np.linalg.norm(embedding)
-                else:
-                    embedding = cached_embeddings[0]
-                
-                return (embedding, (driver_id, name))
-                
+            return (emb, (str(drv["id"]), str(drv["name"])))
         except Exception as e:
-            logger.error(f"❌ Erro ao processar {name}: {e}")
+            logger.error(f"❌ erro no build_one: {e}")
             return None
 
-    # Processamento paralelo
-    if Config.FEATURE_EXTRACTION_THREADS > 1 and len(drivers) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.FEATURE_EXTRACTION_THREADS) as executor:
-            results = list(executor.map(process_single_driver, drivers))
+    results: List[Optional[Tuple[np.ndarray, Tuple[str,str]]]] = []
+    if Config.FEATURE_EXTRACTION_THREADS > 1 and len(authorized_drivers) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.FEATURE_EXTRACTION_THREADS) as ex:
+            results = list(ex.map(build_one, authorized_drivers))
     else:
-        results = [process_single_driver(d) for d in drivers]
+        for d in authorized_drivers:
+            results.append(build_one(d))
 
-    # Coleta resultados
-    for result in results:
-        if result:
-            embedding, (driver_id, name) = result
-            final_embeddings.append(embedding)
-            id_name_pairs.append((driver_id, name))
+    for r in results:
+        if r is None:
+            continue
+        emb, pair = r
+        # já normalizado; reforça L2
+        known_embeddings.append(l2_normalize(emb))
+        id_name_pairs.append(pair)
 
-    return final_embeddings, id_name_pairs
+    logger.info(f"✅ embeddings conhecidos: {len(known_embeddings)}")
+    return known_embeddings, id_name_pairs
 
 def build_known_embeddings(authorized_drivers_payload) -> tuple[list[np.ndarray], list[tuple[str, str]]]:
     """
@@ -984,15 +944,13 @@ def verify_driver_optimized():
             query_emb = extract_embedding_optimized(face_crop)
             if query_emb is None:
                 detection_results.append({
-                    "authorized": False,
-                    "driver_id": None,
+                    "authorized": False, "driver_id": None,
                     "driver_name": f"Desconhecido #{int(face_index)+1}",
                     "confidence": float(0.0),
                     "x": int(x), "y": int(y), "width": int(w), "height": int(h)
                 })
                 continue
 
-            # Garante normalização do query (idempotente)
             query_emb = l2_normalize(query_emb)
 
             sims: list[float] = []
@@ -1000,15 +958,13 @@ def verify_driver_optimized():
             for i, known_emb in enumerate(known_embeddings):
                 did, dname = id_name_pairs[i]
                 candidates.append((did, dname))
-                # normaliza known
-                known_emb = l2_normalize(known_emb)
-                sim = calculate_cosine_similarity_cached(query_emb, known_emb, cache_key=f"{did}_{face_index}")
+                known_norm = l2_normalize(known_emb)
+                sim = calculate_cosine_similarity_cached(query_emb, known_norm, cache_key=f"{did}_{face_index}")
                 sims.append(float(sim))
 
             if not sims:
                 detection_results.append({
-                    "authorized": False,
-                    "driver_id": None,
+                    "authorized": False, "driver_id": None,
                     "driver_name": f"Desconhecido #{int(face_index)+1}",
                     "confidence": float(0.0),
                     "x": int(x), "y": int(y), "width": int(w), "height": int(h)
@@ -1021,26 +977,52 @@ def verify_driver_optimized():
             margin = float(best_sim - second_best)
             best_driver_id, best_driver_name = candidates[best_idx]
 
-            authorized = (
+            # Caminho estrito
+            strict_ok = (
                 best_sim >= float(th_strict) and
                 margin >= float(Config.MIN_DECISION_MARGIN) and
                 float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE) and
                 best_driver_id not in used_driver_ids
             )
 
+            # Caminho fallback “no-quase”: rechecagem robusta + margem maior
+            fallback_ok = False
+            if (Config.ENABLE_FALLBACK_RECHECK
+                and not strict_ok
+                and best_sim >= float(th_loose)
+                and margin >= float(Config.FALLBACK_MARGIN)
+                and float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE)):
+                # Rechecagem contra o mesmo candidato
+                re_sim = robust_recheck_similarity(face_crop, known_embeddings[best_idx])
+                logger.info(f"🔁 Recheck sim={re_sim:.3f} (best={best_sim:.3f}, loose={th_loose:.3f})")
+                fallback_ok = re_sim >= float(Config.FALLBACK_THRESHOLD)
+
+            authorized = (strict_ok or fallback_ok)
+
             final_id = best_driver_id if authorized else None
             final_name = best_driver_name if authorized else f"Desconhecido #{int(face_index)+1}"
             if authorized:
                 used_driver_ids.add(best_driver_id)
+
+            # DEBUG INFO
+            debug = {
+                "best_sim": float(best_sim),
+                "second_best": float(second_best),
+                "margin": float(margin),
+                "th_strict": float(th_strict),
+                "th_loose": float(th_loose),
+                "quality": float(validation.confidence),
+                "fallback_used": bool(not strict_ok and authorized),
+            }
 
             detection_results.append({
                 "authorized": bool(authorized),
                 "driver_id": final_id,
                 "driver_name": final_name,
                 "confidence": float(round(best_sim * 100.0, 1)),
-                "x": int(x), "y": int(y), "width": int(w), "height": int(h)
+                "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "debug": debug,                    # <- novo
             })
-
         authorized_count = int(sum(1 for r in detection_results if r["authorized"]))
         unknown_count = int(len(detection_results) - authorized_count)
 
@@ -1055,7 +1037,6 @@ def verify_driver_optimized():
     except Exception as e:
         logger.error(f"❌ Erro na verificação: {e}\n{traceback.format_exc()}")
         return create_error_response(f"Erro interno: {str(e)}")
-# ...existing code...
 
 @app.route("/analytics", methods=["GET"])
 def get_analytics():
@@ -1188,6 +1169,108 @@ def _infer_embedding_np(img_norm: np.ndarray) -> np.ndarray | None:
     except Exception as e:
         logger.error(f"❌ _infer_embedding_np failed: {e}")
         return None
+
+def robust_recheck_similarity(face_rgb: np.ndarray, known_emb: np.ndarray) -> float:
+    """
+    Rechecagem robusta:
+      - usa extract_embedding_optimized (com flip TTA)
+      - aplica pequenas perturbações (blur leve, brilho)
+      - retorna média das similaridades contra known_emb (L2-normalizados)
+    """
+    try:
+        variants = [face_rgb]
+        # blur leve
+        variants.append(cv2.GaussianBlur(face_rgb, (3, 3), 0))
+        # ajuste de brilho/contraste leve
+        brighter = np.clip(face_rgb.astype(np.float32) * 1.06, 0, 255).astype(np.uint8)
+        variants.append(brighter)
+
+        sims = []
+        known_emb = l2_normalize(known_emb)
+        for v in variants:
+            q = extract_embedding_optimized(v)
+            if q is None:
+                continue
+            q = l2_normalize(q)
+            sims.append(calculate_cosine_similarity_cached(q, known_emb, cache_key=None))
+        if not sims:
+            return 0.0
+        return float(np.mean(sims))
+    except Exception as e:
+        logger.error(f"❌ robust_recheck_similarity failed: {e}")
+        return 0.0
+
+def _download_rgb_image(url: str) -> Optional[np.ndarray]:
+    try:
+        with urllib.request.urlopen(url, timeout=Config.REQUEST_TIMEOUT) as resp:
+            data = np.frombuffer(resp.read(), dtype=np.uint8)
+        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        logger.error(f"❌ download image failed: {e}")
+        return None
+
+def _detect_biggest_face(rgb: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
+    try:
+        cas = get_face_cascade() or get_face_cascade_fallback()
+        if cas is None:
+            return None
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        faces = cas.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(40,40)
+        )
+        if len(faces) == 0:
+            return None
+        faces = sorted(faces, key=lambda r: r[2]*r[3], reverse=True)
+        x,y,w,h = map(int, faces[0])
+        m = int(w*0.15)
+        x1,y1 = max(0,x-m), max(0,y-m)
+        x2,y2 = min(rgb.shape[1], x+w+m), min(rgb.shape[0], y+h+m)
+        return (x1,y1,x2-x1,y2-y1)
+    except Exception as e:
+        logger.error(f"❌ detect biggest face failed: {e}")
+        return None
+
+def compute_driver_template_embedding(photo_url: str) -> Optional[np.ndarray]:
+    """
+    Gera um template estável: média de embeddings (aug leve + TTA) e L2 normaliza no final.
+    """
+    rgb = _download_rgb_image(photo_url)
+    if rgb is None:
+        return None
+
+    bbox = _detect_biggest_face(rgb)
+    if bbox is None:
+        # usa a imagem inteira como fallback
+        face = rgb
+    else:
+        x,y,w,h = bbox
+        face = rgb[y:y+h, x:x+w]
+
+    # variantes leves
+    variants = [face]
+    try:
+        variants.append(cv2.GaussianBlur(face, (3,3), 0))
+        brighter = np.clip(face.astype(np.float32)*1.05, 0, 255).astype(np.uint8)
+        darker   = np.clip(face.astype(np.float32)*0.95, 0, 255).astype(np.uint8)
+        variants.extend([brighter, darker])
+    except Exception:
+        pass
+
+    embs = []
+    for v in variants:
+        e = extract_embedding_optimized(v)
+        if e is not None:
+            embs.append(l2_normalize(e))
+    if not embs:
+        return None
+
+    # média + normaliza
+    tpl = np.mean(np.stack(embs, axis=0), axis=0).astype(Config.EMBEDDING_FP)
+    tpl = l2_normalize(tpl)
+    return tpl
 
 # Garante que todas as funções acima existem antes de iniciar o servidor
 if __name__ == "__main__":
