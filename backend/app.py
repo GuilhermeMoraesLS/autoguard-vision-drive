@@ -54,44 +54,48 @@ logger = logging.getLogger(__name__)
 class Config:
     # --- Qualidade / detecção ---
     PRELOAD_CASCADES = True
-    MIN_FACE_AREA = 5000
-    MIN_QUALITY_SCORE = 0.7
-    REQUIRE_EYE_DETECTION = True
+    MIN_FACE_AREA = 4000
+    MIN_QUALITY_SCORE = 0.60
+    REQUIRE_EYE_DETECTION = False
 
-    # --- Embeddings / extração ---
+    # --- Similaridade / decisão (SFace + cosseno) ---
+    MIN_DECISION_MARGIN = 0.06
+    MIN_STRICT_THRESHOLD = 0.60   # ↓ aceitação “normal”
+    MIN_LOOSE_THRESHOLD  = 0.52   # ↓ faixa de quase
+
+    ENABLE_FALLBACK_RECHECK = True
+    FALLBACK_THRESHOLD = 0.58     # recheck precisa atingir isso
+    FALLBACK_MARGIN = 0.06
+
+    # --- Embeddings ---
     FACE_SIZE = 160
-    EMBEDDING_DIMENSIONS = 512
+    EMBEDDING_DIMENSIONS = 128     # SFace retorna 128D
     EMBEDDING_NORMALIZE = True
-    EMBEDDING_TTA_FLIP = True
+    EMBEDDING_TTA_FLIP = False     # não necessário com alinhamento SFace
     EMBEDDING_FP = np.float32
     ENABLE_FAST_MODE = True
 
-    # --- Similaridade / decisão ---
-    MIN_DECISION_MARGIN = 0.08
-    MIN_STRICT_THRESHOLD = 0.89   # ↓
-    MIN_LOOSE_THRESHOLD  = 0.83   # ↓
+    # --- Modelos OpenCV ---
+    USE_SFACE = True
+    MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+    YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
+    SFACE_MODEL = "face_recognition_sface_2021dec.onnx"
+    YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+    SFACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
-    # Fallback “no-quase”
-    ENABLE_FALLBACK_RECHECK = True
-    FALLBACK_THRESHOLD = 0.835    # ↓ aceita 83.5% na rechecagem
-    FALLBACK_MARGIN = 0.10          # exige Δ >= 0.10 no fallback
-
-    # --- Paralelismo / runtime (faltavam) ---
+    # --- Paralelismo / cache ---
     MAX_PARALLEL_FACES = 4
     FEATURE_EXTRACTION_THREADS = 4
-    REQUEST_TIMEOUT = 5  # seg para baixar fotos
-
-    # --- Cache ---
+    REQUEST_TIMEOUT = 5
     CACHE_MAX_SIZE = 1024
-    CACHE_TTL = 600  # segundos
-
-    # Parâmetros de detecção de face (Haar)
+    CACHE_TTL = 600
+    # Haar (fallback)
     HAAR_PRIMARY = 'haarcascade_frontalface_alt2.xml'
     HAAR_FALLBACK = 'haarcascade_frontalface_default.xml'
-    FACE_DET_SCALES = [1.08, 1.10, 1.20]         # múltiplas tentativas
-    FACE_DET_MIN_NEIGHBORS = [5, 4, 3]           # múltiplas tentativas
-    FACE_MIN_SIZE = (40, 40)                     # menor que 60x60
-    FACE_MAX_SIZE = None                         # sem limite superior (evita cortar rostos grandes)
+    FACE_DET_SCALES = [1.08, 1.10, 1.20]
+    FACE_DET_MIN_NEIGHBORS = [5, 4, 3]
+    FACE_MIN_SIZE = (40, 40)
+    FACE_MAX_SIZE = None
 
 # Enums otimizados
 class ValidationReason(Enum):
@@ -152,6 +156,7 @@ setup_cors()
 class OptimizedCache:
     def __init__(self):
         self.driver_embeddings = TTLCache(maxsize=Config.CACHE_MAX_SIZE, ttl=Config.CACHE_TTL)
+        self.similarity = TTLCache(maxsize=4096, ttl=300)
         self.face_detections = TTLCache(maxsize=256, ttl=300)  # Cache de detecções (5 min)
         self.similarity_cache = TTLCache(maxsize=512, ttl=600)  # Cache de similaridades (10 min)
         self.lock = threading.RLock()
@@ -329,82 +334,155 @@ def validate_face_authenticity_fast(face_rgb: np.ndarray) -> ValidationResult:
     try:
         h, w = face_rgb.shape[:2]
         area = h * w
-        
-        # 1. Verifica área mínima (mais permissivo)
         if area < Config.MIN_FACE_AREA:
             return ValidationResult(
                 is_valid=False,
                 reason=ValidationReason.FACE_TOO_SMALL,
-                details=f"Área: {area}",
-                confidence=0.1
-            )
-        
-        # 2. Verifica proporções (mais permissivo)
-        aspect_ratio = w / h
-        if not 0.5 <= aspect_ratio <= 1.6:
-            return ValidationResult(
-                is_valid=False,
-                reason=ValidationReason.INVALID_PROPORTIONS,
-                details=f"Proporção: {aspect_ratio:.2f}",
+                details={"area": int(area)},
                 confidence=0.2
             )
-        
-        # 3. Detecção de olhos simplificada (pula se modo rápido)
-        if not Config.ENABLE_FAST_MODE:
+
+        # Proporção
+        aspect_ratio = w / max(h, 1)
+
+        # Detecção de olhos (opcional): agora NÃO reprova, apenas impacta a confiança
+        eyes_detected = 0
+        if Config.REQUIRE_EYE_DETECTION:
             eye_cascade = get_eye_cascade()
             if eye_cascade is not None:
                 face_gray = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY)
                 eyes = eye_cascade.detectMultiScale(
-                    face_gray,
-                    scaleFactor=1.2,  # Menos preciso, mais rápido
-                    minNeighbors=2,   # Menos preciso, mais rápido
-                    minSize=(15, 15)  # Menor que antes
+                    face_gray, scaleFactor=1.2, minNeighbors=2, minSize=(15, 15)
                 )
-                if len(eyes) < 1:
-                    return ValidationResult(
-                        is_valid=False,
-                        reason=ValidationReason.NO_EYES_DETECTED,
-                        details=f"Olhos: {len(eyes)}",
-                        confidence=0.3
-                    )
-        
-        # 4. Verifica uniformidade simplificada
+                eyes_detected = len(eyes)
+
+        # Uniformidade/contraste
         face_gray = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2GRAY)
-        std_dev = np.std(face_gray)
-        if std_dev < 8:  # era 10 – ligeiramente menos rígido
+        std_dev = float(np.std(face_gray))
+
+        if std_dev < 6:  # ligeiramente mais permissivo
             return ValidationResult(
                 is_valid=False,
                 reason=ValidationReason.TOO_UNIFORM,
                 details=f"Std: {std_dev:.2f}",
-                confidence=0.4
+                confidence=0.35
             )
-        
-        # Calcula confiança simplificada
-        confidence = min(1.0, (
-            (area / Config.MIN_FACE_AREA) * 0.4 +
-            (1 - abs(aspect_ratio - 1.0)) * 0.3 +
-            min(std_dev / 30, 1.0) * 0.3
-        ))
-        
+
+        # Métrica de nitidez simples (gradiente)
+        gy, gx = np.gradient(face_gray.astype(np.float32))
+        sharpness = float(np.mean(gx**2 + gy**2))
+
+        # Confiança composta
+        confidence = 0.0
+        confidence += min(1.0, (area / max(Config.MIN_FACE_AREA, 1)) * 0.35)
+        confidence += max(0.0, (1.0 - abs(aspect_ratio - 1.0))) * 0.20
+        confidence += min(1.0, std_dev / 30.0) * 0.25
+        confidence += min(1.0, sharpness / 2000.0) * 0.20
+
+        # Penalização leve se não detectar olhos (sem reprovar)
+        if eyes_detected == 0:
+            confidence *= 0.9
+
         return ValidationResult(
             is_valid=True,
             reason=ValidationReason.VALID_FACE,
-            details={"area": area, "aspect_ratio": aspect_ratio, "std_dev": std_dev},
-            confidence=confidence
+            details={"area": int(area), "aspect_ratio": float(aspect_ratio), "std_dev": std_dev, "sharpness": sharpness, "eyes": eyes_detected},
+            confidence=float(confidence)
         )
-        
     except Exception as e:
-        logger.error(f"❌ Erro na validação: {e}")
+        logger.error(f"❌ Validação de face falhou: {e}")
         return ValidationResult(
-            is_valid=False,
+            is_valid=True,
             reason=ValidationReason.VALIDATION_ERROR,
             details=str(e),
-            confidence=0.0
+            confidence=0.6
         )
+
+def _align_with_yunet(rgb_img: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Tenta alinhar o rosto com YuNet + SFace.alignCrop.
+    Retorna imagem RGB alinhada ou None se falhar.
+    """
+    try:
+        if not (Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None):
+            return None
+        bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+        get_yunet_detector((bgr.shape[1], bgr.shape[0]))
+        num, faces = _yunet_detector.detect(bgr)
+        if faces is None or len(faces) == 0:
+            return None
+        face = faces[0]
+        aligned = _sface_recognizer.alignCrop(bgr, face)
+        if aligned is None or aligned.size == 0:
+            return None
+        return cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        logger.debug(f"align_with_yunet falhou: {e}")
+        return None
+
+def _align_roi_with_yunet(rgb_img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> Optional[np.ndarray]:
+    """
+    Tenta alinhar um ROI usando YuNet; se falhar retorna None.
+    """
+    try:
+        if not (Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None):
+            return None
+        roi = rgb_img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+        bgr = cv2.cvtColor(roi, cv2.COLOR_RGB2BGR)
+        get_yunet_detector((bgr.shape[1], bgr.shape[0]))
+        num, faces = _yunet_detector.detect(bgr)
+        if faces is None or len(faces) == 0:
+            return None
+        aligned = _sface_recognizer.alignCrop(bgr, faces[0])
+        if aligned is None or aligned.size == 0:
+            return None
+        return cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        logger.debug(f"align_roi_with_yunet falhou: {e}")
+        return None
 
 def detect_and_validate_faces_parallel(rgb_image: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], np.ndarray, ValidationResult]]:
     """Detecção de faces otimizada com processamento paralelo"""
     try:
+        # 1) Caminho preferencial: YuNet (+ landmarks) -> SFace.alignCrop
+        if Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None:
+            bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+            get_yunet_detector((bgr.shape[1], bgr.shape[0]))
+            try:
+                num, faces = _yunet_detector.detect(bgr)
+            except Exception as e:
+                logger.warning(f"⚠️ YuNet detect falhou, caindo para Haar: {e}")
+                num, faces = 0, None
+
+            validated = []
+            if faces is not None and len(faces) > 0:
+                for face in faces:
+                    x, y, w, h = face[:4].astype(int)
+                    try:
+                        aligned_bgr = _sface_recognizer.alignCrop(bgr, face)
+                        aligned_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        # fallback: crop com margem
+                        m = int(w * 0.15)
+                        x1 = max(0, x - m); y1 = max(0, y - m)
+                        x2 = min(bgr.shape[1], x + w + m); y2 = min(bgr.shape[0], y + h + m)
+                        aligned_rgb = rgb_image[y1:y2, x1:x2]
+
+                    if aligned_rgb.size == 0:
+                        continue
+
+                    validation = validate_face_authenticity_fast(aligned_rgb)
+                    if validation.is_valid:
+                        validated.append(((int(x), int(y), int(w), int(h)), aligned_rgb, validation))
+
+                if len(validated) > 0:
+                    logger.info(f"✅ {len(validated)} faces válidas (YuNet/SFace)")
+                    return validated
+            # Se nada válido com YuNet, continua no fallback Haar
+
+        # 2) Fallback Haar (mantém sua lógica atual), mas tenta alinhar ROI com YuNet antes
         face_cascade = get_face_cascade()
         face_cascade_fb = get_face_cascade_fallback()
         if face_cascade is None and face_cascade_fb is None:
@@ -424,18 +502,13 @@ def detect_and_validate_faces_parallel(rgb_image: np.ndarray) -> List[Tuple[Tupl
         
         gray = cv2.cvtColor(rgb_resized, cv2.COLOR_RGB2GRAY)
 
-        # ===== Tentativas de detecção (vários parâmetros + fallback) =====
         faces = []
         cascades = [c for c in [face_cascade, face_cascade_fb] if c is not None]
         found = False
         for cas_idx, cascade in enumerate(cascades):
             for sf in Config.FACE_DET_SCALES:
                 for mn in Config.FACE_DET_MIN_NEIGHBORS:
-                    params = dict(
-                        scaleFactor=sf,
-                        minNeighbors=mn,
-                        flags=cv2.CASCADE_SCALE_IMAGE  # evita CANNY pruning que pode perder rosto suave
-                    )
+                    params = dict(scaleFactor=sf, minNeighbors=mn, flags=cv2.CASCADE_SCALE_IMAGE)
                     if Config.FACE_MIN_SIZE:
                         params["minSize"] = Config.FACE_MIN_SIZE
                     if Config.FACE_MAX_SIZE:
@@ -446,10 +519,8 @@ def detect_and_validate_faces_parallel(rgb_image: np.ndarray) -> List[Tuple[Tupl
                     if len(faces) > 0:
                         found = True
                         break
-                if found:
-                    break
-            if found:
-                break
+                if found: break
+            if found: break
 
         if len(faces) == 0:
             logger.warning("❌ Nenhuma face detectada (todas as tentativas).")
@@ -457,25 +528,27 @@ def detect_and_validate_faces_parallel(rgb_image: np.ndarray) -> List[Tuple[Tupl
 
         # Escala coordenadas de volta
         if scale_back != 1.0:
-            faces = [(int(x * scale_back), int(y * scale_back), 
-                      int(w * scale_back), int(h * scale_back)) for x, y, w, h in faces]
+            faces = [(int(x * scale_back), int(y * scale_back), int(w * scale_back), int(h * scale_back)) for x, y, w, h in faces]
+        else:
+            faces = [(int(x), int(y), int(w), int(h)) for x, y, w, h in faces]
 
-        # Processa faces (paralelo opcional)
         validated_faces = []
         faces_to_process = faces[:Config.MAX_PARALLEL_FACES]
 
         def process_single_face(face_coords):
             x, y, w, h = face_coords
-            margin = int(w * 0.15)  # AUMENTA margem para crop mais estável
-            x1 = max(0, x - margin)
-            y1 = max(0, y - margin)
-            x2 = min(rgb_image.shape[1], x + w + margin)
-            y2 = min(rgb_image.shape[0], y + h + margin)
-            face_crop = rgb_image[y1:y2, x1:x2]
-            if face_crop.size > 0:
-                validation = validate_face_authenticity_fast(face_crop)
+            margin = int(w * 0.15)
+            x1 = max(0, x - margin); y1 = max(0, y - margin)
+            x2 = min(rgb_image.shape[1], x + w + margin); y2 = min(rgb_image.shape[0], y + h + margin)
+
+            # Tenta alinhar o ROI com YuNet; se falhar usa o crop simples
+            aligned_rgb = _align_roi_with_yunet(rgb_image, x1, y1, x2, y2)
+            face_rgb = aligned_rgb if aligned_rgb is not None else rgb_image[y1:y2, x1:x2]
+
+            if face_rgb.size > 0:
+                validation = validate_face_authenticity_fast(face_rgb)
                 if validation.is_valid:
-                    return ((x, y, w, h), face_crop, validation)
+                    return ((x, y, w, h), face_rgb, validation)
                 else:
                     logger.info(f"⚠️ Face rejeitada na validação: {validation.reason} conf={validation.confidence:.2f}")
             return None
@@ -485,12 +558,11 @@ def detect_and_validate_faces_parallel(rgb_image: np.ndarray) -> List[Tuple[Tupl
                 results = list(executor.map(process_single_face, faces_to_process))
                 validated_faces = [r for r in results if r is not None]
         else:
-            for face_coords in faces_to_process:
-                r = process_single_face(face_coords)
-                if r:
-                    validated_faces.append(r)
+            for fc in faces_to_process:
+                r = process_single_face(fc)
+                if r: validated_faces.append(r)
 
-        logger.info(f"✅ {len(validated_faces)} faces válidas de {len(faces)} detectadas")
+        logger.info(f"✅ {len(validated_faces)} faces válidas de {len(faces)} detectadas (fallback Haar)")
         return validated_faces
     except Exception as e:
         logger.error(f"❌ Erro na detecção de faces: {e}\n{traceback.format_exc()}")
@@ -674,33 +746,29 @@ class OptimizedEmbeddingExtractor:
 
 def extract_embedding_optimized(face_rgb: np.ndarray) -> np.ndarray | None:
     """
-    - pré-processa rosto
-    - faz TTA (flip horizontal opcional)
-    - normaliza L2 o embedding final
+    Com SFace: usa alignCrop previamente e extrai vetor 128D; normaliza L2.
+    Fallback: pipeline antigo.
     """
     try:
+        # SFace espera BGR; aqui face_rgb já vem alinhado da detecção YuNet
+        if Config.USE_SFACE and get_sface_recognizer() is not None:
+            bgr = cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR)
+            feat = _sface_recognizer.feature(bgr)  # (1,128) float32
+            if feat is None:
+                return None
+            emb = np.asarray(feat).reshape(-1).astype(Config.EMBEDDING_FP)
+            if Config.EMBEDDING_NORMALIZE:
+                emb = l2_normalize(emb)
+            return emb
+
+        # ===== Fallback para o extrator antigo =====
         proc = preprocess_face_for_embedding(face_rgb)
-
-        # Seu pipeline de inferência aqui (ex.: ONNXRuntime, TF, etc.)
-        # Supondo função existente _infer_embedding_np(img_np) -> (D,)
-        emb1 = _infer_embedding_np(proc)  # ...existing model inference...
-
+        emb1 = _infer_embedding_np(proc)
         if emb1 is None:
             return None
-
-        if Config.EMBEDDING_TTA_FLIP:
-            proc_flip = np.ascontiguousarray(proc[:, ::-1, :])
-            emb2 = _infer_embedding_np(proc_flip)
-            if emb2 is not None and emb2.shape == emb1.shape:
-                emb = (emb1.astype(Config.EMBEDDING_FP) + emb2.astype(Config.EMBEDDING_FP)) * 0.5
-            else:
-                emb = emb1.astype(Config.EMBEDDING_FP)
-        else:
-            emb = emb1.astype(Config.EMBEDDING_FP)
-
+        emb = emb1.astype(Config.EMBEDDING_FP)
         if Config.EMBEDDING_NORMALIZE:
             emb = l2_normalize(emb)
-
         return emb
     except Exception as e:
         logger.error(f"❌ Erro em extract_embedding_optimized: {e}")
@@ -737,14 +805,17 @@ def calculate_cosine_similarity_cached(v1: np.ndarray, v2: np.ndarray, cache_key
         return 0.0
 
 def calculate_dynamic_thresholds_fast() -> tuple[float, float]:
+    """
+    Para SFace + cosseno (L2), mantém pisos adequados.
+    """
     try:
         if len(similarity_history) < 10:
-            return max(0.94, Config.MIN_STRICT_THRESHOLD), max(0.88, Config.MIN_LOOSE_THRESHOLD)
+            return max(0.80, Config.MIN_STRICT_THRESHOLD), max(0.60, Config.MIN_LOOSE_THRESHOLD)
         recent = similarity_history[-100:]
         mean = float(np.mean(recent))
         std = float(np.std(recent))
-        strict = max(Config.MIN_STRICT_THRESHOLD, min(0.98, mean + 1.0 * std))
-        loose  = max(Config.MIN_LOOSE_THRESHOLD,  min(0.95, mean + 0.3 * std))
+        strict = max(Config.MIN_STRICT_THRESHOLD, min(0.95, mean + 0.5 * std))
+        loose  = max(Config.MIN_LOOSE_THRESHOLD,  min(0.85, mean - 0.2 * std))
         return strict, loose
     except Exception:
         return Config.MIN_STRICT_THRESHOLD, Config.MIN_LOOSE_THRESHOLD
@@ -753,23 +824,40 @@ def calculate_dynamic_thresholds_fast() -> tuple[float, float]:
 # PROCESSAMENTO DE MOTORISTAS OTIMIZADO
 # =====================================================
 
+def _cache_key_driver(did: str, url: str) -> str:
+    return f"drv:{did}:{url}"
+
+def get_cached_driver_embedding(did: str, url: str) -> Optional[np.ndarray]:
+    try:
+        return optimized_cache.driver_embeddings.get(_cache_key_driver(did, url))
+    except Exception:
+        return None
+
+def set_cached_driver_embedding(did: str, url: str, emb: np.ndarray) -> None:
+    try:
+        optimized_cache.driver_embeddings[_cache_key_driver(did, url)] = emb
+    except Exception:
+        pass
+
 def process_driver_embeddings_parallel(authorized_drivers) -> Tuple[List[np.ndarray], List[Tuple[str, str]]]:
-    """
-    Constrói (known_embeddings, id_name_pairs) com template robusto para cada motorista.
-    """
+    """Constrói (known_embeddings, id_name_pairs) com template robusto por motorista e cache."""
     known_embeddings: List[np.ndarray] = []
     id_name_pairs: List[Tuple[str, str]] = []
 
     def build_one(drv):
-        try:
-            emb = compute_driver_template_embedding(drv["photo_url"])
-            if emb is None:
-                logger.warning(f"⚠️ embedding vazio para {drv.get('name')}")
-                return None
-            return (emb, (str(drv["id"]), str(drv["name"])))
-        except Exception as e:
-            logger.error(f"❌ erro no build_one: {e}")
+        did = str(drv["id"])
+        url = str(drv["photo_url"])
+        cached = get_cached_driver_embedding(did, url)
+        if cached is not None:
+            return (cached, (did, str(drv["name"])))
+
+        emb = compute_driver_template_embedding(url)
+        if emb is None:
+            logger.warning(f"⚠️ embedding vazio para {drv.get('name')}")
             return None
+        emb = l2_normalize(emb)
+        set_cached_driver_embedding(did, url, emb)
+        return (emb, (did, str(drv["name"])))
 
     results: List[Optional[Tuple[np.ndarray, Tuple[str,str]]]] = []
     if Config.FEATURE_EXTRACTION_THREADS > 1 and len(authorized_drivers) > 1:
@@ -783,11 +871,10 @@ def process_driver_embeddings_parallel(authorized_drivers) -> Tuple[List[np.ndar
         if r is None:
             continue
         emb, pair = r
-        # já normalizado; reforça L2
         known_embeddings.append(l2_normalize(emb))
         id_name_pairs.append(pair)
 
-    logger.info(f"✅ embeddings conhecidos: {len(known_embeddings)}")
+    logger.info(f"✅ embeddings conhecidos (cache aware): {len(known_embeddings)}")
     return known_embeddings, id_name_pairs
 
 def build_known_embeddings(authorized_drivers_payload) -> tuple[list[np.ndarray], list[tuple[str, str]]]:
@@ -819,9 +906,9 @@ def health_check():
     """Health check otimizado"""
     try:
         health_data = {
-            "face_detection": "✅ OpenCV Haar Cascades (Otimizado)" if get_face_cascade() else "❌ Não disponível",
-            "eye_detection": "✅ Detecção de olhos (Otimizado)" if get_eye_cascade() else "❌ Não disponível",
-            "embedding_method": f"Features otimizadas ({Config.EMBEDDING_DIMENSIONS}D)",
+            "face_detection": "✅ YuNet" if (Config.USE_SFACE and get_yunet_detector() is not None) else ("✅ Haar" if get_face_cascade() else "❌"),
+            "eye_detection": "✅" if get_eye_cascade() else "❌",
+            "embedding_method": ("SFace (128D)" if Config.USE_SFACE and get_sface_recognizer() is not None else f"Features otimizadas ({Config.EMBEDDING_DIMENSIONS}D)"),
             "performance_mode": "🚀 Modo rápido" if Config.ENABLE_FAST_MODE else "🔍 Modo preciso",
             "cache_stats": {
                 "driver_embeddings": len(optimized_cache.driver_embeddings),
@@ -832,14 +919,12 @@ def health_check():
                 "parallel_faces": Config.MAX_PARALLEL_FACES,
                 "threads": Config.FEATURE_EXTRACTION_THREADS,
                 "face_size": Config.FACE_SIZE,
-                "embedding_dims": Config.EMBEDDING_DIMENSIONS
-            },
-            "haar_primary": "ok" if get_face_cascade() is not None else "missing",
-            "haar_fallback": "ok" if get_face_cascade_fallback() is not None else "missing",
+            }
         }
         return create_success_response(health_data, "API otimizada online!")
     except Exception as e:
-        return create_error_response(f"Erro no sistema: {str(e)}")
+        logger.error(f"❌ Health check erro: {e}")
+        return create_error_response("Falha no health", 500)
 
 # Adicione esta função antes do endpoint verify_driver_optimized:
 
@@ -981,6 +1066,7 @@ def verify_driver_optimized():
             strict_ok = (
                 best_sim >= float(th_strict) and
                 margin >= float(Config.MIN_DECISION_MARGIN) and
+                validation.is_valid and
                 float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE) and
                 best_driver_id not in used_driver_ids
             )
@@ -991,8 +1077,8 @@ def verify_driver_optimized():
                 and not strict_ok
                 and best_sim >= float(th_loose)
                 and margin >= float(Config.FALLBACK_MARGIN)
+                and validation.is_valid
                 and float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE)):
-                # Rechecagem contra o mesmo candidato
                 re_sim = robust_recheck_similarity(face_crop, known_embeddings[best_idx])
                 logger.info(f"🔁 Recheck sim={re_sim:.3f} (best={best_sim:.3f}, loose={th_loose:.3f})")
                 fallback_ok = re_sim >= float(Config.FALLBACK_THRESHOLD)
@@ -1012,7 +1098,7 @@ def verify_driver_optimized():
                 "th_strict": float(th_strict),
                 "th_loose": float(th_loose),
                 "quality": float(validation.confidence),
-                "fallback_used": bool(not strict_ok and authorized),
+                "fallback_used": bool(not strict_ok and authorized)
             }
 
             detection_results.append({
@@ -1021,7 +1107,7 @@ def verify_driver_optimized():
                 "driver_name": final_name,
                 "confidence": float(round(best_sim * 100.0, 1)),
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
-                "debug": debug,                    # <- novo
+                "debug": debug,
             })
         authorized_count = int(sum(1 for r in detection_results if r["authorized"]))
         unknown_count = int(len(detection_results) - authorized_count)
@@ -1063,21 +1149,73 @@ def not_found(error):
 # INICIALIZAÇÃO OTIMIZADA
 # =====================================================
 
+# Modelos SFace / YuNet
+_sface_recognizer: Optional[any] = None
+_yunet_detector: Optional[any] = None
+
+def _ensure_model_file(filename: str, url: str) -> str:
+    os.makedirs(Config.MODEL_DIR, exist_ok=True)
+    path = os.path.join(Config.MODEL_DIR, filename)
+    if not os.path.exists(path):
+        try:
+            logger.info(f"⬇️ Baixando modelo {filename}...")
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(r.content)
+            logger.info(f"✅ Modelo salvo em {path}")
+        except Exception as e:
+            logger.error(f"❌ Falha ao baixar {filename}: {e}")
+    return path
+
+def get_sface_recognizer():
+    global _sface_recognizer
+    if not Config.USE_SFACE:
+        return None
+    if _sface_recognizer is None:
+        try:
+            model_path = _ensure_model_file(Config.SFACE_MODEL, Config.SFACE_URL)
+            # config vazio para SFace
+            _sface_recognizer = cv2.FaceRecognizerSF.create(model_path, "")
+            logger.info("✅ SFace carregado")
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar SFace: {e}")
+            _sface_recognizer = None
+    return _sface_recognizer
+
+def get_yunet_detector(input_size: Tuple[int, int] | None = None):
+    global _yunet_detector
+    if not Config.USE_SFACE:
+        return None
+    if _yunet_detector is None:
+        try:
+            model_path = _ensure_model_file(Config.YUNET_MODEL, Config.YUNET_URL)
+            _yunet_detector = cv2.FaceDetectorYN.create(model_path, "", (320, 320), 0.85, 0.3, 5000)
+            logger.info("✅ YuNet carregado")
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar YuNet: {e}")
+            _yunet_detector = None
+    if _yunet_detector is not None and input_size is not None:
+        try:
+            _yunet_detector.setInputSize(input_size)
+        except Exception:
+            pass
+    return _yunet_detector
+
 def initialize_optimized_system():
     """Inicialização otimizada do sistema"""
-    logger.info("🚀 AutoGuard Vision Backend - MODO OTIMIZADO")
-    logger.info(f"⚡ Performance: Faces paralelas={Config.MAX_PARALLEL_FACES}, Threads={Config.FEATURE_EXTRACTION_THREADS}")
-    logger.info(f"🧠 Embeddings: {Config.EMBEDDING_DIMENSIONS}D, Face size={Config.FACE_SIZE}x{Config.FACE_SIZE}")
-    logger.info(f"🔧 Modo rápido: {'✅ Ativado' if Config.ENABLE_FAST_MODE else '❌ Desativado'}")
-    
-    # Pré-carrega componentes
-    face_cascade = get_face_cascade()
-    eye_cascade = get_eye_cascade()
-    
-    if face_cascade and eye_cascade:
+    try:
+        preload_cascades()
+        if Config.USE_SFACE:
+            get_sface_recognizer()
+            get_yunet_detector((640, 480))
+        logger.info("🚀 AutoGuard Vision Backend - MODO OTIMIZADO")
+        logger.info(f"⚡ Performance: Faces paralelas={Config.MAX_PARALLEL_FACES}, Threads={Config.FEATURE_EXTRACTION_THREADS}")
+        logger.info(f"🧠 Embeddings: {Config.EMBEDDING_DIMENSIONS}D, Face size={Config.FACE_SIZE}x{Config.FACE_SIZE}")
+        logger.info(f"🔧 Modo rápido: {'✅ Ativado' if Config.ENABLE_FAST_MODE else '❌ Desativado'}")
         logger.info("✅ Sistema de reconhecimento facial otimizado pronto!")
-    else:
-        logger.warning("⚠️ Alguns classificadores faltando - funcionalidade limitada")
+    except Exception as e:
+        logger.error(f"❌ Erro na inicialização: {e}")
 
 def main():
     """Função principal otimizada"""
@@ -1235,42 +1373,127 @@ def _detect_biggest_face(rgb: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
 
 def compute_driver_template_embedding(photo_url: str) -> Optional[np.ndarray]:
     """
-    Gera um template estável: média de embeddings (aug leve + TTA) e L2 normaliza no final.
+    Template robusto: detecta com YuNet, alinha com SFace e faz média de variações.
     """
     rgb = _download_rgb_image(photo_url)
     if rgb is None:
         return None
 
-    bbox = _detect_biggest_face(rgb)
-    if bbox is None:
-        # usa a imagem inteira como fallback
-        face = rgb
+    # tenta YuNet para obter alinhado
+    emb_list = []
+    if Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None:
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        get_yunet_detector((bgr.shape[1], bgr.shape[0]))
+        try:
+            num, faces = _yunet_detector.detect(bgr)
+        except Exception:
+            num, faces = 0, None
+        if faces is not None and len(faces) > 0:
+            face = faces[0]
+            try:
+                aligned = _sface_recognizer.alignCrop(bgr, face)
+                aligned_rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+            except Exception:
+                aligned_rgb = rgb
+        else:
+            aligned_rgb = rgb
     else:
-        x,y,w,h = bbox
-        face = rgb[y:y+h, x:x+w]
+        aligned_rgb = rgb
 
-    # variantes leves
-    variants = [face]
+    variants = [aligned_rgb]
     try:
-        variants.append(cv2.GaussianBlur(face, (3,3), 0))
-        brighter = np.clip(face.astype(np.float32)*1.05, 0, 255).astype(np.uint8)
-        darker   = np.clip(face.astype(np.float32)*0.95, 0, 255).astype(np.uint8)
-        variants.extend([brighter, darker])
+        variants.append(cv2.GaussianBlur(aligned_rgb, (3,3), 0))
+        variants.append(np.clip(aligned_rgb.astype(np.float32)*1.05,0,255).astype(np.uint8))
+        variants.append(np.clip(aligned_rgb.astype(np.float32)*0.95,0,255).astype(np.uint8))
     except Exception:
         pass
 
-    embs = []
     for v in variants:
         e = extract_embedding_optimized(v)
         if e is not None:
-            embs.append(l2_normalize(e))
-    if not embs:
-        return None
+            emb_list.append(l2_normalize(e))
 
-    # média + normaliza
-    tpl = np.mean(np.stack(embs, axis=0), axis=0).astype(Config.EMBEDDING_FP)
-    tpl = l2_normalize(tpl)
-    return tpl
+    if not emb_list:
+        return None
+    tpl = np.mean(np.stack(emb_list, axis=0), axis=0).astype(Config.EMBEDDING_FP)
+    return l2_normalize(tpl)
+
+def compute_display_confidence(best_sim: float, second_best: float, th_loose: float, th_strict: float,
+                               quality: float, used_fallback: bool, re_sim: float | None) -> float:
+    """
+    Converte similaridade (coseno) em % amigável:
+    - < th_loose  -> 0–50%
+    - th_loose–th_strict -> 50–80%
+    - >= th_strict -> 80–100%
+    Ajuste leve por margem e qualidade. Se fallback foi usado, considera re_sim.
+    """
+    base_sim = max(best_sim, re_sim or 0.0) if used_fallback else best_sim
+
+    # mapeamento por faixas
+    if base_sim <= th_loose:
+        pct = 50.0 * max(0.0, base_sim / max(th_loose, 1e-6))  # 0..50
+    elif base_sim < th_strict:
+        pct = 50.0 + 30.0 * ((base_sim - th_loose) / max(th_strict - th_loose, 1e-6))  # 50..80
+    else:
+        pct = 80.0 + 20.0 * ((base_sim - th_strict) / max(1.0 - th_strict, 1e-6))  # 80..100
+
+    # bônus por margem e qualidade
+    margin = max(0.0, best_sim - second_best)
+    margin_bonus = min(10.0, (margin / max(Config.MIN_DECISION_MARGIN, 1e-6)) * 4.0)  # até +10
+    quality_bonus = min(5.0, max(0.0, (quality - Config.MIN_QUALITY_SCORE) / max(1.0 - Config.MIN_QUALITY_SCORE, 1e-6)) * 5.0)
+
+    pct = min(100.0, max(0.0, pct + margin_bonus + quality_bonus))
+    return round(pct, 1)
+
+def build_similarity_matrix(face_embs: list[np.ndarray | None], known_embs: list[np.ndarray]) -> np.ndarray:
+    """
+    Retorna matriz S (n_faces x n_known) com cossenos (L2); linhas com None viram 0.
+    """
+    if not face_embs or not known_embs:
+        return np.zeros((len(face_embs), len(known_embs)), dtype=np.float32)
+    # normaliza todos
+    K = np.stack([l2_normalize(e) for e in known_embs], axis=1)  # (D, n_known) depois transposto em dot
+    S = np.zeros((len(face_embs), len(known_embs)), dtype=np.float32)
+    for i, q in enumerate(face_embs):
+        if q is None:
+            continue
+        qn = l2_normalize(q).astype(np.float32)
+        S[i, :] = (qn @ K).astype(np.float32)  # produto interno (cosseno) pois L2-normalizado
+    return S
+
+def greedy_global_assignment(S: np.ndarray) -> list[tuple[int, int, float]]:
+    """
+    Matching guloso global: ordena pares por similaridade desc e aloca evitando reutilização
+    de face/motorista. Retorna lista de (face_idx, driver_idx, sim).
+    """
+    if S.size == 0:
+        return []
+    pairs = [ (float(S[i,j]), i, j) for i in range(S.shape[0]) for j in range(S.shape[1]) ]
+    pairs.sort(key=lambda t: t[0], reverse=True)
+    used_faces, used_drivers, match = set(), set(), []
+    for sim, i, j in pairs:
+        if i in used_faces or j in used_drivers:
+            continue
+        # só marca; decisão final (threshold/margem) vem depois
+        used_faces.add(i); used_drivers.add(j); match.append((i, j, float(sim)))
+    return match
+
+def check_enrollment_conflicts(known_embs: list[np.ndarray], id_name_pairs: list[tuple[str,str]], warn_threshold: float = 0.72) -> list[str]:
+    """
+    Detecta pares de motoristas cadastrados muito semelhantes (risco de confusão).
+    """
+    warnings: list[str] = []
+    n = len(known_embs)
+    if n < 2:
+        return warnings
+    embs = [l2_normalize(e) for e in known_embs]
+    for a in range(n):
+        for b in range(a+1, n):
+            sim = float(np.dot(embs[a], embs[b]))
+            if sim >= warn_threshold:
+                wa = f"Possível conflito entre '{id_name_pairs[a][1]}' e '{id_name_pairs[b][1]}' (sim={sim:.3f})."
+                warnings.append(wa)
+    return warnings
 
 # Garante que todas as funções acima existem antes de iniciar o servidor
 if __name__ == "__main__":
