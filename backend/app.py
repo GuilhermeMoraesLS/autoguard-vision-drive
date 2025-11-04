@@ -1011,104 +1011,99 @@ def verify_driver_optimized():
         all_detected_faces = detect_and_validate_faces_parallel(rgb_image)
         all_detected_faces = remove_duplicate_faces(all_detected_faces, min_distance=80)
 
-        # known_embeddings e id_name_pairs já existem aqui
-        # GARANTE ALINHAMENTO EXPLÍCITO (id, name, embedding) por índice
-        known = []
-        for i in range(len(known_embeddings)):
-            did, dname = id_name_pairs[i]
-            emb = known_embeddings[i]
-            known.append((did, dname, emb))
+        # ==== NOVO: extrair embedding de TODAS as faces e montar a matriz de similaridade ====
+        face_embeddings: List[Optional[np.ndarray]] = []
+        for _, face_crop, _ in all_detected_faces:
+            face_embeddings.append(extract_embedding_optimized(face_crop))
+
+        S = build_similarity_matrix(face_embeddings, known_embeddings)  # (n_faces x n_known)
+        assignments = greedy_global_assignment(S)  # [(face_idx, driver_idx, sim)]
+        assigned_by_face: Dict[int, Tuple[int, float]] = {fi: (dj, sim) for fi, dj, sim in assignments}
 
         detection_results = []
         used_driver_ids = set()
-
         th_strict, th_loose = calculate_dynamic_thresholds_fast()
-        # ...existing code...
 
         for face_index, ((x, y, w, h), face_crop, validation) in enumerate(all_detected_faces):
-            query_emb = extract_embedding_optimized(face_crop)
-            if query_emb is None:
-                detection_results.append({
-                    "authorized": False, "driver_id": None,
-                    "driver_name": f"Desconhecido #{int(face_index)+1}",
-                    "confidence": float(0.0),
-                    "x": int(x), "y": int(y), "width": int(w), "height": int(h)
-                })
-                continue
+            # Defaults
+            final_id = None
+            final_name = f"Desconhecido #{int(face_index)+1}"
+            authorized = False
+            best_sim = 0.0
+            second_best = 0.0
+            re_sim: Optional[float] = None
+            fallback_used = False
 
-            query_emb = l2_normalize(query_emb)
+            # Se temos embedding e conhecidos
+            if face_embeddings[face_index] is not None and S.shape[1] > 0:
+                row = S[face_index, :]
 
-            sims: list[float] = []
-            candidates: list[tuple[str, str]] = []
-            for i, known_emb in enumerate(known_embeddings):
-                did, dname = id_name_pairs[i]
-                candidates.append((did, dname))
-                known_norm = l2_normalize(known_emb)
-                sim = calculate_cosine_similarity_cached(query_emb, known_norm, cache_key=f"{did}_{face_index}")
-                sims.append(float(sim))
+                # Usa o pareamento global exclusivo, se existir
+                if face_index in assigned_by_face:
+                    best_idx, best_sim = assigned_by_face[face_index]
+                    # segundo melhor exclui o best_idx
+                    second_best = float(np.max(np.delete(row, best_idx))) if row.size >= 2 else 0.0
+                else:
+                    best_idx = int(np.argmax(row))
+                    best_sim = float(row[best_idx])
+                    second_best = float(np.sort(row)[-2]) if row.size >= 2 else 0.0
 
-            if not sims:
-                detection_results.append({
-                    "authorized": False, "driver_id": None,
-                    "driver_name": f"Desconhecido #{int(face_index)+1}",
-                    "confidence": float(0.0),
-                    "x": int(x), "y": int(y), "width": int(w), "height": int(h)
-                })
-                continue
+                margin = float(best_sim - second_best)
+                best_driver_id, best_driver_name = id_name_pairs[best_idx]
 
-            best_idx = int(np.argmax(sims))
-            best_sim = float(sims[best_idx])
-            second_best = float(sorted(sims)[-2] if len(sims) >= 2 else 0.0)
-            margin = float(best_sim - second_best)
-            best_driver_id, best_driver_name = candidates[best_idx]
+                # Caminho estrito
+                strict_ok = (
+                    best_sim >= float(th_strict) and
+                    margin >= float(Config.MIN_DECISION_MARGIN) and
+                    validation.is_valid and
+                    float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE) and
+                    best_driver_id not in used_driver_ids
+                )
 
-            # Caminho estrito
-            strict_ok = (
-                best_sim >= float(th_strict) and
-                margin >= float(Config.MIN_DECISION_MARGIN) and
-                validation.is_valid and
-                float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE) and
-                best_driver_id not in used_driver_ids
+                # Fallback “no-quase”
+                fallback_ok = False
+                if (Config.ENABLE_FALLBACK_RECHECK
+                    and not strict_ok
+                    and best_sim >= float(th_loose)
+                    and margin >= float(Config.FALLBACK_MARGIN)
+                    and validation.is_valid
+                    and float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE)
+                    and best_driver_id not in used_driver_ids):
+                    re_sim = robust_recheck_similarity(face_crop, known_embeddings[best_idx])
+                    fallback_ok = re_sim >= float(Config.FALLBACK_THRESHOLD)
+
+                authorized = (strict_ok or fallback_ok)
+                fallback_used = bool(fallback_ok and not strict_ok)
+                if authorized:
+                    final_id = best_driver_id
+                    final_name = best_driver_name
+                    used_driver_ids.add(best_driver_id)
+
+            # Confiança exibida (opcional usar a função de calibração se já adicionada)
+            display_conf = compute_display_confidence(
+                best_sim=best_sim,
+                second_best=second_best,
+                th_loose=float(th_loose),
+                th_strict=float(th_strict),
+                quality=float(validation.confidence),
+                used_fallback=fallback_used,
+                re_sim=re_sim
             )
-
-            # Caminho fallback “no-quase”: rechecagem robusta + margem maior
-            fallback_ok = False
-            if (Config.ENABLE_FALLBACK_RECHECK
-                and not strict_ok
-                and best_sim >= float(th_loose)
-                and margin >= float(Config.FALLBACK_MARGIN)
-                and validation.is_valid
-                and float(validation.confidence) >= float(Config.MIN_QUALITY_SCORE)):
-                re_sim = robust_recheck_similarity(face_crop, known_embeddings[best_idx])
-                logger.info(f"🔁 Recheck sim={re_sim:.3f} (best={best_sim:.3f}, loose={th_loose:.3f})")
-                fallback_ok = re_sim >= float(Config.FALLBACK_THRESHOLD)
-
-            authorized = (strict_ok or fallback_ok)
-
-            final_id = best_driver_id if authorized else None
-            final_name = best_driver_name if authorized else f"Desconhecido #{int(face_index)+1}"
-            if authorized:
-                used_driver_ids.add(best_driver_id)
-
-            # DEBUG INFO
-            debug = {
-                "best_sim": float(best_sim),
-                "second_best": float(second_best),
-                "margin": float(margin),
-                "th_strict": float(th_strict),
-                "th_loose": float(th_loose),
-                "quality": float(validation.confidence),
-                "fallback_used": bool(not strict_ok and authorized)
-            }
 
             detection_results.append({
                 "authorized": bool(authorized),
                 "driver_id": final_id,
                 "driver_name": final_name,
-                "confidence": float(round(best_sim * 100.0, 1)),
+                "confidence": float(display_conf),
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
-                "debug": debug,
+                "debug": {
+                    "raw_best_sim": float(best_sim),
+                    "second_best": float(second_best),
+                    "margin": float(best_sim - second_best),
+                    "assigned_driver_index": int(assigned_by_face[face_index][0]) if face_index in assigned_by_face else None
+                }
             })
+
         authorized_count = int(sum(1 for r in detection_results if r["authorized"]))
         unknown_count = int(len(detection_results) - authorized_count)
 
