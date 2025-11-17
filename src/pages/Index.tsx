@@ -104,10 +104,10 @@ const Index = () => {
 
         setCar(carData);
 
-        // ✅ Buscar motoristas autorizados diretamente da tabela authorized_drivers
+        // ✅ Buscar motoristas autorizados incluindo face_encoding
         const { data: driversData, error: driversError } = await supabase
           .from("authorized_drivers")
-          .select("id, name, photo_url")
+          .select("id, name, photo_url, face_encoding") // Incluir face_encoding
           .eq("car_id", carId);
 
         if (driversError) throw driversError;

@@ -13,5 +13,23 @@ export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABL
     storage: localStorage,
     persistSession: true,
     autoRefreshToken: true,
+  },
+  global: {
+    headers: {
+      'x-client-info': 'autoguard-vision-web'
+    },
+    fetch: (url, options = {}) => {
+      return fetch(url, {
+        ...options,
+        // Aumenta timeout para uploads e downloads
+        signal: options.signal || AbortSignal.timeout(30000),
+      });
+    },
+  },
+  db: {
+    schema: 'public',
+  },
+  realtime: {
+    timeout: 30000,
   }
 });

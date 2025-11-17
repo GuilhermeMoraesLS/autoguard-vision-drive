@@ -37,6 +37,7 @@ interface UseVerificationProps {
     id: string;
     name: string;
     photo_url: string;
+    face_encoding?: string;
   }>;
 }
 
@@ -67,6 +68,8 @@ export const useVerification = ({ carId, authorizedDrivers }: UseVerificationPro
           car_id: carId,
           authorized_drivers: authorizedDrivers
         }),
+        // Adiciona timeout de 30 segundos para requests longos
+        signal: AbortSignal.timeout(30000),
       });
 
       if (!response.ok) {

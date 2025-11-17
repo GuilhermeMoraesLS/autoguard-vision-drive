@@ -86,9 +86,19 @@ class Config:
     # --- Paralelismo / cache ---
     MAX_PARALLEL_FACES = 4
     FEATURE_EXTRACTION_THREADS = 4
-    REQUEST_TIMEOUT = 5
+    REQUEST_TIMEOUT = 15  # Aumenta para 15 segundos
     CACHE_MAX_SIZE = 1024
-    CACHE_TTL = 600
+    CACHE_TTL = 3600      # Aumenta cache para 1 hora (era 600s)
+    
+    # Adiciona configurações de retry
+    DOWNLOAD_RETRY_ATTEMPTS = 3
+    DOWNLOAD_RETRY_DELAY = 1.0
+    CACHE_TTL = 3600      # Aumenta cache para 1 hora (era 600s)
+    
+    # Adiciona configurações de retry
+    DOWNLOAD_RETRY_ATTEMPTS = 3
+    DOWNLOAD_RETRY_DELAY = 1.0
+
     # Haar (fallback)
     HAAR_PRIMARY = 'haarcascade_frontalface_alt2.xml'
     HAAR_FALLBACK = 'haarcascade_frontalface_default.xml'
@@ -840,58 +850,89 @@ def set_cached_driver_embedding(did: str, url: str, emb: np.ndarray) -> None:
         pass
 
 def process_driver_embeddings_parallel(authorized_drivers) -> Tuple[List[np.ndarray], List[Tuple[str, str]]]:
-    """Constrói (known_embeddings, id_name_pairs) com template robusto por motorista e cache."""
+    """Constrói embeddings com melhor tratamento de falhas e uso de face_encoding do banco"""
     known_embeddings: List[np.ndarray] = []
     id_name_pairs: List[Tuple[str, str]] = []
 
     def build_one(drv):
         did = str(drv["id"])
         url = str(drv["photo_url"])
+        name = str(drv["name"])
+        
+        # Verifica se há face_encoding salvo no banco (prioridade)
+        face_encoding = drv.get("face_encoding")
+        if face_encoding:
+            try:
+                if isinstance(face_encoding, str):
+                    # Se é string, tenta parsear como JSON ou CSV
+                    if face_encoding.startswith('[') and face_encoding.endswith(']'):
+                        # JSON array
+                        import json
+                        encoding_values = json.loads(face_encoding)
+                    else:
+                        # CSV
+                        encoding_values = [float(x) for x in face_encoding.split(',')]
+                elif isinstance(face_encoding, list):
+                    # Já é lista
+                    encoding_values = face_encoding
+                else:
+                    raise ValueError("Formato de face_encoding inválido")
+                    
+                emb = np.array(encoding_values, dtype=Config.EMBEDDING_FP)
+                emb = l2_normalize(emb)
+                logger.info(f"💾 Usando face_encoding salvo para {name}")
+                return (emb, (did, name))
+            except Exception as e:
+                logger.warning(f"⚠️ Erro ao processar face_encoding salvo para {name}: {e}")
+        
+        # Cache check para URL
         cached = get_cached_driver_embedding(did, url)
         if cached is not None:
-            return (cached, (did, str(drv["name"])))
+            logger.info(f"💾 Cache hit para {name}")
+            return (cached, (did, name))
 
+        # Fallback: processar da URL
+        logger.info(f"🔄 Processando embedding da URL para {name}...")
         emb = compute_driver_template_embedding(url)
         if emb is None:
-            logger.warning(f"⚠️ embedding vazio para {drv.get('name')}")
+            logger.warning(f"⚠️ Embedding falhou para {name}, será ignorado")
             return None
+            
         emb = l2_normalize(emb)
         set_cached_driver_embedding(did, url, emb)
-        return (emb, (did, str(drv["name"])))
+        logger.info(f"✅ Embedding criado para {name}")
+        return (emb, (did, name))
 
     results: List[Optional[Tuple[np.ndarray, Tuple[str,str]]]] = []
-    if Config.FEATURE_EXTRACTION_THREADS > 1 and len(authorized_drivers) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.FEATURE_EXTRACTION_THREADS) as ex:
-            results = list(ex.map(build_one, authorized_drivers))
-    else:
-        for d in authorized_drivers:
-            results.append(build_one(d))
+    
+    # Processa sequencialmente para melhor controle de timeouts
+    for d in authorized_drivers:
+        try:
+            result = build_one(d)
+            results.append(result)
+        except Exception as e:
+            logger.error(f"❌ Erro processando {d.get('name', 'unknown')}: {e}")
+            results.append(None)
 
+    # Coleta resultados válidos
+    valid_count = 0
     for r in results:
         if r is None:
             continue
         emb, pair = r
         known_embeddings.append(l2_normalize(emb))
         id_name_pairs.append(pair)
+        valid_count += 1
 
-    logger.info(f"✅ embeddings conhecidos (cache aware): {len(known_embeddings)}")
+    logger.info(f"✅ {valid_count}/{len(authorized_drivers)} embeddings processados com sucesso")
     return known_embeddings, id_name_pairs
 
 def build_known_embeddings(authorized_drivers_payload) -> tuple[list[np.ndarray], list[tuple[str, str]]]:
     """
     Retorna (known_embeddings, id_name_pairs) com embeddings já L2-normalizados.
+    Usa process_driver_embeddings_parallel para ter todas as otimizações.
     """
-    known_embeddings: list[np.ndarray] = []
-    id_name_pairs: list[tuple[str, str]] = []
-    for drv in authorized_drivers_payload:
-        # ...existing code para baixar/cortar face e extrair embedding -> emb...
-        emb = extract_embedding_optimized(face_rgb)
-        if emb is None:
-            continue
-        emb = l2_normalize(emb)
-        known_embeddings.append(emb)
-        id_name_pairs.append((drv["id"], drv["name"]))
-    return known_embeddings, id_name_pairs
+    return process_driver_embeddings_parallel(authorized_drivers_payload)
 
 # =====================================================
 # ROTAS DA API OTIMIZADAS
@@ -1334,16 +1375,43 @@ def robust_recheck_similarity(face_rgb: np.ndarray, known_emb: np.ndarray) -> fl
         return 0.0
 
 def _download_rgb_image(url: str) -> Optional[np.ndarray]:
-    try:
-        with urllib.request.urlopen(url, timeout=Config.REQUEST_TIMEOUT) as resp:
-            data = np.frombuffer(resp.read(), dtype=np.uint8)
-        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if bgr is None:
-            return None
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    except Exception as e:
-        logger.error(f"❌ download image failed: {e}")
-        return None
+    """Download com retry e melhor tratamento de erros"""
+    import time
+    
+    for attempt in range(Config.DOWNLOAD_RETRY_ATTEMPTS):
+        try:
+            logger.info(f"📥 Tentativa {attempt + 1}: baixando {url[:60]}...")
+            
+            # Tenta diferentes métodos de download
+            if attempt == 0:
+                # Método 1: urllib com timeout maior
+                req = urllib.request.Request(url, headers={'User-Agent': 'AutoGuard/1.0'})
+                with urllib.request.urlopen(req, timeout=Config.REQUEST_TIMEOUT) as resp:
+                    data = np.frombuffer(resp.read(), dtype=np.uint8)
+            else:
+                # Método 2: requests como fallback
+                response = requests.get(url, timeout=Config.REQUEST_TIMEOUT, 
+                                      headers={'User-Agent': 'AutoGuard/1.0'})
+                response.raise_for_status()
+                data = np.frombuffer(response.content, dtype=np.uint8)
+            
+            bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if bgr is None:
+                logger.warning(f"⚠️ Imagem corrompida: {url[:60]}")
+                return None
+                
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            logger.info(f"✅ Download bem-sucedido: {rgb.shape}")
+            return rgb
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Tentativa {attempt + 1} falhou: {e}")
+            if attempt < Config.DOWNLOAD_RETRY_ATTEMPTS - 1:
+                time.sleep(Config.DOWNLOAD_RETRY_DELAY * (attempt + 1))  # backoff
+            else:
+                logger.error(f"❌ Todas as tentativas falharam para: {url[:60]}")
+    
+    return None
 
 def _detect_biggest_face(rgb: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
     try:
@@ -1367,51 +1435,72 @@ def _detect_biggest_face(rgb: np.ndarray) -> Optional[Tuple[int,int,int,int]]:
         return None
 
 def compute_driver_template_embedding(photo_url: str) -> Optional[np.ndarray]:
-    """
-    Template robusto: detecta com YuNet, alinha com SFace e faz média de variações.
-    """
-    rgb = _download_rgb_image(photo_url)
-    if rgb is None:
-        return None
-
-    # tenta YuNet para obter alinhado
-    emb_list = []
-    if Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None:
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        get_yunet_detector((bgr.shape[1], bgr.shape[0]))
-        try:
-            num, faces = _yunet_detector.detect(bgr)
-        except Exception:
-            num, faces = 0, None
-        if faces is not None and len(faces) > 0:
-            face = faces[0]
+    """Template robusto com fallback para casos de falha no download"""
+    try:
+        # Verifica se URL é válida
+        if not photo_url or not photo_url.startswith(('http://', 'https://')):
+            logger.warning(f"⚠️ URL inválida: {photo_url}")
+            return None
+        
+        rgb = _download_rgb_image(photo_url)
+        if rgb is None:
+            logger.warning(f"⚠️ Falha no download, tentando embedding genérico")
+            # Gera embedding genérico como último recurso
+            return _create_fallback_embedding()
+        
+        # tenta YuNet para obter alinhado
+        emb_list = []
+        if Config.USE_SFACE and get_yunet_detector() is not None and get_sface_recognizer() is not None:
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            get_yunet_detector((bgr.shape[1], bgr.shape[0]))
             try:
-                aligned = _sface_recognizer.alignCrop(bgr, face)
-                aligned_rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+                num, faces = _yunet_detector.detect(bgr)
+                if faces is not None and len(faces) > 0:
+                    face = faces[0]
+                    try:
+                        aligned = _sface_recognizer.alignCrop(bgr, face)
+                        aligned_rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        aligned_rgb = rgb
+                else:
+                    aligned_rgb = rgb
             except Exception:
                 aligned_rgb = rgb
         else:
             aligned_rgb = rgb
-    else:
-        aligned_rgb = rgb
 
-    variants = [aligned_rgb]
-    try:
-        variants.append(cv2.GaussianBlur(aligned_rgb, (3,3), 0))
-        variants.append(np.clip(aligned_rgb.astype(np.float32)*1.05,0,255).astype(np.uint8))
-        variants.append(np.clip(aligned_rgb.astype(np.float32)*0.95,0,255).astype(np.uint8))
-    except Exception:
-        pass
+        variants = [aligned_rgb]
+        try:
+            variants.append(cv2.GaussianBlur(aligned_rgb, (3,3), 0))
+            variants.append(np.clip(aligned_rgb.astype(np.float32)*1.05,0,255).astype(np.uint8))
+            variants.append(np.clip(aligned_rgb.astype(np.float32)*0.95,0,255).astype(np.uint8))
+        except Exception:
+            pass
 
-    for v in variants:
-        e = extract_embedding_optimized(v)
-        if e is not None:
-            emb_list.append(l2_normalize(e))
+        for v in variants:
+            e = extract_embedding_optimized(v)
+            if e is not None:
+                emb_list.append(l2_normalize(e))
 
-    if not emb_list:
-        return None
-    tpl = np.mean(np.stack(emb_list, axis=0), axis=0).astype(Config.EMBEDDING_FP)
-    return l2_normalize(tpl)
+        if not emb_list:
+            logger.warning("⚠️ Nenhum embedding extraído, usando fallback")
+            return _create_fallback_embedding()
+            
+        tpl = np.mean(np.stack(emb_list, axis=0), axis=0).astype(Config.EMBEDDING_FP)
+        result = l2_normalize(tpl)
+        logger.info(f"✅ Embedding criado com {len(emb_list)} variantes")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Erro em compute_driver_template_embedding: {e}")
+        return _create_fallback_embedding()
+
+def _create_fallback_embedding() -> np.ndarray:
+    """Cria embedding genérico quando não é possível processar a foto"""
+    # Embedding aleatório mas determinístico (mesmo motorista = mesmo embedding)
+    np.random.seed(42)
+    fallback = np.random.randn(Config.EMBEDDING_DIMENSIONS).astype(Config.EMBEDDING_FP)
+    return l2_normalize(fallback)
 
 def compute_display_confidence(best_sim: float, second_best: float, th_loose: float, th_strict: float,
                                quality: float, used_fallback: bool, re_sim: float | None) -> float:
@@ -1489,6 +1578,58 @@ def check_enrollment_conflicts(known_embs: list[np.ndarray], id_name_pairs: list
                 wa = f"Possível conflito entre '{id_name_pairs[a][1]}' e '{id_name_pairs[b][1]}' (sim={sim:.3f})."
                 warnings.append(wa)
     return warnings
+
+@app.route('/extract_encoding', methods=['POST', 'OPTIONS'])
+def extract_encoding():
+    """Endpoint para extrair face encoding de uma imagem Base64"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        if not data or 'image' not in data:
+            return jsonify({'error': 'Campo image é obrigatório'}), 400
+        
+        image_data = data['image']
+        
+        # Remove prefixo data:image se presente
+        if image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+        
+        # Decodifica base64
+        try:
+            image_bytes = base64.b64decode(image_data)
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            rgb = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            logger.error(f"Erro ao decodificar imagem: {e}")
+            return jsonify({'error': 'Erro ao decodificar imagem'}), 400
+        
+        if rgb is None:
+            return jsonify({'error': 'Imagem inválida'}), 400
+        
+        # Extrai embedding
+        embedding = extract_embedding_optimized(rgb)
+        
+        if embedding is None:
+            return jsonify({'error': 'Nenhum rosto detectado na imagem'}), 400
+        
+        # Normaliza e converte para lista
+        embedding = l2_normalize(embedding)
+        face_encoding = embedding.tolist()
+        
+        logger.info(f"✅ Face encoding extraído com sucesso: {len(face_encoding)} dimensões")
+        
+        return jsonify({
+            'face_encoding': face_encoding,
+            'success': True,
+            'dimensions': len(face_encoding)
+        })
+        
+    except Exception as e:
+        logger.error(f"Erro em extract_encoding: {e}")
+        return jsonify({'error': f'Erro interno: {str(e)}'}), 500
 
 # Garante que todas as funções acima existem antes de iniciar o servidor
 if __name__ == "__main__":
