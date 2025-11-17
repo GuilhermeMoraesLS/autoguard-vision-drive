@@ -127,13 +127,36 @@ const NewDriver = () => {
         .from("driver-photos")
         .getPublicUrl(fileName);
 
-      // Insert driver record
+      // Extract face encoding from photo
+      toast.info("Processando foto e extraindo características faciais...");
+      
+      const { data: encodingData, error: encodingError } = await supabase.functions
+        .invoke('extract-face-encoding', {
+          body: { photo_url: publicUrl }
+        });
+
+      if (encodingError || !encodingData?.face_encoding) {
+        // Delete uploaded photo if face extraction failed
+        await supabase.storage
+          .from("driver-photos")
+          .remove([fileName]);
+        
+        const errorMessage = encodingData?.error || "Erro ao processar a foto";
+        toast.error(errorMessage);
+        setIsLoading(false);
+        return;
+      }
+
+      toast.success("Rosto detectado com sucesso!");
+
+      // Insert driver record with face encoding
       const { error: insertError } = await supabase
         .from("authorized_drivers")
         .insert({
           car_id: id,
           name: result.data.name,
           photo_url: publicUrl,
+          face_encoding: encodingData.face_encoding,
         });
 
       if (insertError) {

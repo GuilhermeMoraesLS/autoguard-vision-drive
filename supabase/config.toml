@@ -1,1 +1,4 @@
 project_id = "rtmupwziyqrrvdnmpcir"
+
+[functions.extract-face-encoding]
+verify_jwt = false
