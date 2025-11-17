@@ -109,7 +109,7 @@ const NewDriver = () => {
 
       // Upload photo to storage
       const fileExt = photoFile.name.split(".").pop();
-      const fileName = `${user.id}/${Date.now()}.${fileExt}`;
+      const fileName = `${user.id}/${crypto.randomUUID()}.${fileExt}`;
       
       const { error: uploadError } = await supabase.storage
         .from("driver-photos")
