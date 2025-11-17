@@ -205,7 +205,6 @@ const FaceVerification = () => {
               <FaceVerificationVisualizer
                 imageData={capturedImage}
                 verificationResult={verificationResult}
-                isLoading={isVerifying}
               />
             </div>
           )}

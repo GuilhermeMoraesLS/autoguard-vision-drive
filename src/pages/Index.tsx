@@ -394,7 +394,6 @@ const Index = () => {
                   <FaceVerificationVisualizer
                     imageData={capturedImage}
                     verificationResult={verificationResult}
-                    isLoading={isVerifying}
                   />
                 ) : (
                   <div className="p-8 text-center bg-card rounded-lg border">

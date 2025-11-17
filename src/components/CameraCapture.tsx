@@ -6,9 +6,10 @@ import { toast } from "sonner";
 interface CameraCaptureProps {
   onCapture: (imageData: string) => void;
   isVerifying: boolean;
+  className?: string;
 }
 
-export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) => {
+export const CameraCapture = ({ onCapture, isVerifying, className }: CameraCaptureProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const streamRef = useRef<MediaStream | null>(null);
@@ -26,7 +27,6 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
       // Vincule o stream ao vídeo após o render
       requestAnimationFrame(() => {
         if (videoRef.current) {
-          // @ts-expect-error - srcObject é suportado em browsers modernos
           videoRef.current.srcObject = stream;
           videoRef.current.play().catch(() => {});
         }
@@ -43,7 +43,6 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
       streamRef.current = null;
     }
     if (videoRef.current) {
-      // @ts-expect-error - srcObject é suportado em browsers modernos
       videoRef.current.srcObject = null;
     }
     setIsStreaming(false);
@@ -52,7 +51,6 @@ export const CameraCapture = ({ onCapture, isVerifying }: CameraCaptureProps) =>
   // Garante que o vídeo receba o stream quando isStreaming mudar
   useEffect(() => {
     if (isStreaming && videoRef.current && streamRef.current) {
-      // @ts-expect-error - srcObject é suportado em browsers modernos
       videoRef.current.srcObject = streamRef.current;
       videoRef.current.play().catch(() => {});
     }
